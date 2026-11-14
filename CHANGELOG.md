@@ -2,6 +2,36 @@
 
 所有 noteworthy 的插件更新都会记录在此文件中。
 
+## \[1.7.0] - 2026-11-14
+
+### Added
+
+- Commit 收集改为分页拉取，新增 `commit_fetch.max_commits`（默认 50，范围 1-500）：修复旧实现固定 `per_page=10` 且只取第一页、两次检查之间超过 10 个提交时旧提交被静默丢弃的问题；达到上限时通知中提示「更早提交未展示」
+- 新增仓库级推送分流：仓库字典配置支持 `notification_targets`（仓库专属私聊，兼容别名 `private_targets`）和 `exclusive`（为 `true` 时不再叠加全局目标）；Commit、Issues 增量通知、合并转发、失败重试统一按仓库路由
+- 新增 `commit_display.message_mode`：`full`（默认，完整展示并保留正文换行）/ `first_line`（只展示第一行/提交标题）；文本通知、图片卡片、合并转发节点同步生效
+- 新增 Issues 增量通知：与 Commit 同轮检查，检测新增 Issue、新评论、标题/标签/评论数变化、Issue 关闭，并按「每仓库每轮一张卡」推送；文本卡附带标签、评论数、状态等进度信息，图片卡复用 Commit 卡片模板（`issue_output_format: text/image`）
+- 图片卡片模板上下文新增 `count_text`、`summary_text`、`message_full`、`message_first_line`、`commits[].details`、`truncated`，自定义模板可用来区分 Commit / Issues 卡片
+
+### Changed
+
+- Commit 文本通知接入 `message_max_length` 分片逻辑，超长通知自动拆分为多条发送
+- Issues open 列表改为分页获取（最多 500 条）；超过上限时跳过 Issue 关闭检测，避免把分页之外的 Issue 误判为已关闭
+- Issues 评论正文按 `max_comment_length` 截断（此前配置项未实际生效）
+- 统一主发送记录去重键为 `owner/repo/branch`，并纳入仓库专属私聊目标（私聊键带 `dm:` 前缀），修复重试时重复推送
+- 合并转发失败重试保留 `truncated` 元数据
+
+### Removed
+
+- 移除 Issues cron 定时汇总（`issues_cron_enabled`、`issues_cron_expression`、`issues_push_min_interval`）及其定时任务、快照/推送日志逻辑；由随仓库轮询的 Issues 增量通知取代
+- 移除不再使用的 `utils/cron_utils.py`
+
+### Fixed
+
+- 修复提交通知未按 `message_max_length` 拆分、长消息可能发送失败的问题
+- 修复失败通知重试使用的仓库键缺少 branch，导致主发送记录去重失效的问题
+- 修复合并转发成功时只标记群目标、未标记私聊目标的问题
+- 修复 `max_comment_length` 配置项未生效的问题
+
 ## \[1.6.0] - 2026-10-27
 
 ### Added

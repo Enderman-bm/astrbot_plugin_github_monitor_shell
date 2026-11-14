@@ -17,23 +17,26 @@
 
 # 手动触发指令
 
-/github_status  手动触发监控检查
+/github_monitor  手动触发监控检查
 
-/github_monitor  查看监控状态
+/github_status  查看监控状态
 
 # 配置说明
 
 除了原有的配置项，现在还支持：
 
-- `group_notification_targets`: 群通知目标，可以将通知发送到指定的群聊中
+- `group_notification_targets`: 全局群通知目标，所有仓库（仓库配置 `exclusive: true` 时除外）都会通知这些群聊
 - `time_zone`: 时间显示时区（默认 `Asia/Shanghai`，即可显示为北京时间）
 - `time_format`: 时间显示格式，使用 Python `strftime` 语法，默认 `%Y-%m-%d %H:%M:%S`
 - `forward_merge`: 合并转发推送，开启后本轮轮询检测到的 commit 通知会先收集、再整合成一条「合并转发」聊天记录发送
 - `commit_stats`: 提交变更统计（默认开启），在通知中显示本次提交的改动文件数与增删行数，多个提交时额外汇总一行「本轮总计」；`max_commits` 控制单次通知最多统计几个提交（默认 10，填 0 关闭统计）
+- `commit_fetch`: Commit 收集设置。`max_commits` 控制单次检查最多收集多少个提交（默认 50，范围 1-500）。插件会分页拉取，直到遇到上次记录的提交或达到上限；达到上限时通知中会提示「更早提交未展示」。原来的实现固定只取 10 条且不翻页，两次检查之间提交较多时会静默丢提交
+- `commit_display`: Commit 信息展示。`message_mode` 支持 `full`（默认，完整展示并保留正文换行）和 `first_line`（只展示第一行/提交标题），文本通知、图片卡片、合并转发节点同步生效
+- `issue_output_format`: Issues 增量通知输出格式，`text`（默认，结构化文本卡）或 `image`（图片卡片，复用 Commit 卡片模板主题）
 
 ## 推送目标格式
 
-`notification_targets`（私聊）、`group_notification_targets`（群聊）以及仓库配置中的 `groups` 支持两种格式：
+`notification_targets`（私聊）、`group_notification_targets`（群聊）、仓库配置中的 `groups` / `notification_targets` 均支持两种格式：
 
 ### 传统格式
 
@@ -56,9 +59,9 @@ QQ 官方机器人（qq_official / qq_official_webhook）没有传统数字群�
 
 ## 仓库配置增强功能
 
-现在支持为每个仓库单独配置通知群组：
+现在支持为每个仓库单独配置通知群组，并可通过 `exclusive` 实现仓库级分流。
 
-### 字符串格式配置（推荐）
+### 字符串格式配置
 
 ```json
 "repositories": [
@@ -67,40 +70,79 @@ QQ 官方机器人（qq_official / qq_official_webhook）没有传统数字群�
 ]
 ```
 
-### 字典格式配置
+字符串格式只支持群聊目标，且始终与全局目标并集（向后兼容）。
+
+### 字典格式配置（推荐）
 
 ```json
 "repositories": [
 {
-"owner": "owner",
-"repo": "repo"
+"owner": "owner-a",
+"repo": "repo-a",
+"groups": ["111111"],
+"notification_targets": ["10001"],
+"exclusive": true
 },
 {
-"owner": "owner",
-"repo": "repo",
-"groups": ["123456", "91219736"]
+"owner": "owner-b",
+"repo": "repo-b",
+"groups": ["222222"]
 }
 ]
 ```
 
-示例：
+- `groups`: 该仓库专属群聊目标。
+- `notification_targets`: 该仓库专属私聊目标（也兼容别名 `private_targets`）。
+- `exclusive`: 默认 `false`，保持旧行为「全局目标 + 仓库目标」并集；设为 `true` 时该仓库**只发给自己的目标**，不再叠加全局私聊/群聊目标。
+- `branch`: 可选，指定监控分支；不填则使用仓库默认分支。
+
+示例：仓库 A 只发群 111111 和私聊 10001，仓库 B 只发群 222222，互不串群：
 
 ```json
 "repositories": [
-"1592363624/astrbot_plugin_github_monitor_shell",
-"1592363624/astrbot_plugin_github_monitor_shell|123456789|91219736"
+{
+"owner": "owner-a",
+"repo": "repo-a",
+"groups": ["111111"],
+"notification_targets": ["10001"],
+"exclusive": true
+},
+{
+"owner": "owner-b",
+"repo": "repo-b",
+"groups": ["222222"],
+"exclusive": true
+}
 ]
 ```
 
-表示监控 1592363624/astrbot_plugin_github_monitor_shell 仓库，当第二个仓库有更新时，除了全局配置的群通知目标外，还会通知
-123456789 和 91219736 群组。
+> 只要把 `group_notification_targets` 留空、只填每个仓库的 `groups`，也能实现基础分流；`exclusive` 主要用于在保留全局目标的同时，让某个仓库排除全局目标。
 
-## 文转图（Commit 图片卡片）
+## Issues 增量通知
 
-将 commit 更新通知渲染为图片卡片发送（依赖 AstrBot 的 T2I 文转图服务，请先在后台配置好）。以下选项均位于插件配置的「文转图（图片通知）」分组：
+Issues 不再使用 cron 定时汇总，而是和 Commit 一样随每次仓库检查做增量检测。请保持 `issue_monitor_enabled` 开启（默认开启），每轮检查会对比上次快照，发现以下变化时立即推送：
 
-- `commit_output_format`: `text`（默认）或 `image`
-- `commit_image_template`: 内置 `terminal`（默认）/ `github_dark` / `light` / `retro_term` / `miku` / `sakura` 6 套主题，或选 `random` 每次随机
+- 新增 Issue
+- Issue 有新评论
+- Issue 标题、标签、评论数变化
+- Issue 被关闭（上次快照存在、本次 open 列表消失）
+
+推送粒度为**每仓库每轮一张卡**，汇总本轮该仓库的新增、更新、关闭事件，并附带标签、评论数、状态等进度信息。推送目标遵循仓库级分流（`groups` / `notification_targets` / `exclusive`）。
+
+输出格式由 `issue_output_format` 控制：
+
+- `text`（默认）：结构化文本卡，评论中的图片会随文本一起补发（单条最多 6 张）；
+- `image`：复用 Commit 图片卡片模板渲染为图片，渲染失败自动降级为文本卡。
+
+首次纳入监控的仓库只建立基线快照，不推送，避免存量 Issues 刷屏。open issues 超过 500 条时会跳过关闭检测，避免把分页之外的 Issue 误判为已关闭。
+
+## 文转图（Commit / Issues 图片卡片）
+
+将 Commit 更新或 Issues 增量通知渲染为图片卡片发送（依赖 AstrBot 的 T2I 文转图服务，请先在后台配置好）。以下选项均位于插件配置的「文转图（图片通知）」分组：
+
+- `commit_output_format`: Commit 通知格式，`text`（默认）或 `image`
+- `issue_output_format`: Issues 增量通知格式，`text`（默认）或 `image`
+- `commit_image_template`: Commit 与 Issues 卡片共用的模板：内置 `terminal`（默认）/ `github_dark` / `light` / `retro_term` / `miku` / `sakura` 6 套主题，或选 `random` 每次随机
 - `enable_base64_image`: 图片传输使用 Base64 编码（默认开启；关闭则用文件路径，需协议端与 AstrBot 共享文件系统）
 - `t2i_image_type` / `t2i_quality` / `t2i_scale`: 图片格式（png/jpeg）、质量、清晰度
 
@@ -112,7 +154,13 @@ QQ 官方机器人（qq_official / qq_official_webhook）没有传统数字群�
 
 ### 自定义模板
 
-把 `.html` 文件放入插件数据目录的 `templates/` 文件夹（通常 `AstrBot/data/plugin_data/GitHub监控插件/templates/`），文件名（不含后缀）即模板名，填到 `commit_image_template` 即可使用，也会加入 `random` 的随机池。模板为 Jinja2 语法，可用变量：`title`、`repo_name`、`repo_url`、`branch`（可为 `None`）、`commit_count`、`generated_at`、`commits`（每项含 `sha_short` / `message` / `author` / `time` / `url`，以及变更统计 `has_stats` / `stats_additions` / `stats_deletions` / `stats_files`，未开启统计或合并提交等场景 `has_stats` 为 `False`），以及多提交汇总 `has_total_stats` / `total_additions` / `total_deletions`。
+把 `.html` 文件放入插件数据目录的 `templates/` 文件夹（通常 `AstrBot/data/plugin_data/GitHub监控插件/templates/`），文件名（不含后缀）即模板名，填到 `commit_image_template` 即可使用，也会加入 `random` 的随机池。模板为 Jinja2 语法，可用变量：
+
+- 通用：`title`、`repo_name`、`repo_url`、`branch`（可为 `None`）、`commit_count`、`count_text`（例如「3 个新提交」或「2 个 Issues 动态」）、`generated_at`、`summary_text`（Issues 卡片的汇总文案，Commit 为空）、`truncated`（Commit 是否达到单次收集上限）
+- `commits`：每项含 `sha_short` / `message` / `message_full` / `message_first_line` / `author` / `time` / `url` / `details`（Issues 卡片的状态行，Commit 为空），以及变更统计 `has_stats` / `stats_additions` / `stats_deletions` / `stats_files`（未开启统计或合并提交等场景 `has_stats` 为 `False`）
+- 多提交汇总：`has_total_stats` / `total_additions` / `total_deletions`
+
+`message` 跟随 `commit_display.message_mode`（`full` 或 `first_line`）；需要固定展示完整内容或第一行时，可直接使用 `message_full` / `message_first_line`。Issues 图片卡片复用同一套模板，`commits` 中每一项代表一个 Issue 事件（新增/更新/关闭）。自定义模板使用 `full` 模式时，建议给 `.message` 加 `white-space: pre-wrap`，否则 HTML 会把换行折叠成空格。
 
 模板需完全自包含（CSS 内联、无外部资源），并在 `<head>` 加上 `<meta name="viewport" content="width=<卡片宽度>, height=10">` 让 T2I 按内容裁剪，可参考内置 `templates/<主题>/commit_card.html`。
 
@@ -141,7 +189,7 @@ QQ 官方机器人（qq_official / qq_official_webhook）没有传统数字群�
 
 1. 插件按原有逻辑轮询仓库，检测到新 commit 时只把通知放入待发送队列，不立即发送；
 2. 本轮所有仓库检查完成后，按推送目标分组：同一个目标收到的所有 commit 通知合并为一条转发记录（节点顺序即检测顺序）；
-3. 全局群通知目标、仓库专属群目标、私聊目标分别独立成组，互不影响；
+3. 全局群通知目标、仓库专属群目标、私聊目标分别独立成组，互不影响；`exclusive: true` 的仓库只使用自己的目标；
 4. 若某个目标发送失败，该目标会被写入待重试队列，下一轮轮询时自动重试，其余目标不受影响。
 
 ### 平台支持

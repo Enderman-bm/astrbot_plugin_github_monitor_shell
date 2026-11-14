@@ -61,7 +61,8 @@
   .sha { color: #e5c07b; flex-shrink: 0; }
   .sha a { color: #e5c07b; text-decoration: none; }
   .commit-main { flex: 1; min-width: 0; }
-  .message { color: #f0f0f0; word-break: break-word; overflow-wrap: anywhere; }
+  .message { color: #f0f0f0; word-break: break-word; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .details { display: block; font-size: 11px; color: #8a8a8a; margin-top: 1px; }
   .stats { display: block; font-size: 11px; margin-top: 1px; }
   .stats .add { color: #98c379; }
   .stats .del { color: #e06c75; }
@@ -108,13 +109,14 @@
       # <a href="{{ repo_url or '#' }}">{{ repo_name or '未知仓库' }}</a>{% if branch %}<span class="branch-tag">{{ branch }}</span>{% endif %}
     </div>
     <div class="head-info">
-      <span class="title-text">{{ title or 'GitHub 仓库更新通知' }}</span> · 新增 {{ commit_count or 0 }} 个提交
+      <span class="title-text">{{ title or 'GitHub 仓库更新通知' }}</span> · {{ count_text or ('新增 ' ~ (commit_count or 0) ~ ' 个提交') }}
     </div>
     {% for c in commits %}
     <div class="commit">
       <span class="sha">{% if c.url %}<a href="{{ c.url }}">{{ c.sha_short or '-------' }}</a>{% else %}{{ c.sha_short or '-------' }}{% endif %}</span>
       <div class="commit-main">
         <span class="message">{{ c.message or '(无提交信息)' }}</span>
+        {% if c.details %}<span class="details">{{ c.details }}</span>{% endif %}
         {% if c.has_stats %}<span class="stats"><span class="add">+{{ c.stats_additions or 0 }}</span> <span class="del">-{{ c.stats_deletions or 0 }}</span>{% if c.stats_files is not none %}<span class="files">{{ c.stats_files }} 个文件</span>{% endif %}</span>{% endif %}
       </div>
       <span class="meta"><span class="author">{{ c.author or '未知作者' }}</span><span class="time">{{ c.time or '' }}</span></span>
@@ -122,10 +124,12 @@
     {% else %}
     <div class="empty">（暂无新提交）</div>
     {% endfor %}
-    {% if has_total_stats %}
+    {% if summary_text %}
+    <div class="summary"><span>{{ summary_text }}</span></div>
+    {% elif has_total_stats %}
     <div class="summary"><span>total:</span><span class="add">+{{ total_additions }}</span><span class="del">-{{ total_deletions }}</span></div>
     {% endif %}
-    <div class="footer">更新时间：{{ generated_at or '未知' }}</div>
+    <div class="footer">更新时间：{{ generated_at or '未知' }}{% if truncated %} · ⚠️ 更早提交未展示{% endif %}</div>
   </div>
 </div>
 </body>

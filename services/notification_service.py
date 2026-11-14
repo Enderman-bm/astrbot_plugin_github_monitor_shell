@@ -4,6 +4,7 @@ import os
 import uuid
 from datetime import datetime
 from typing import List, Dict, Optional
+from zoneinfo import ZoneInfo
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -13,10 +14,19 @@ from astrbot.core.platform.astr_message_event import MessageSesion
 from astrbot.core.star import StarTools
 
 from ..utils.file_utils import write_json_atomic
-from ..utils.text_utils import split_long_message
+from ..utils.markdown_utils import extract_image_urls
+from ..utils.target_utils import combine_target_keys, dedupe_targets
+from ..utils.text_utils import (
+    commit_message_for_display,
+    split_long_message,
+    truncate_text,
+)
 from ..utils.time_utils import format_commit_datetime
 
 __all__ = ["NotificationService", "format_commit_datetime"]
+
+# 单条 Issues 增量通知最多携带的评论图片数量，防止刷屏
+MAX_ISSUE_IMAGES_PER_PUSH = 6
 
 
 class NotificationService:
@@ -57,9 +67,19 @@ class NotificationService:
         # 文转图相关配置（image_output 分组）
         image_cfg = (config or {}).get("image_output", {}) or {}
         self.commit_output_format = image_cfg.get("commit_output_format", "text")
+        self.issue_output_format = image_cfg.get("issue_output_format", "text")
         self.enable_base64_image = bool(image_cfg.get("enable_base64_image", True))
+        # Commit message 展示方式（commit_display 分组）
+        display_cfg = (config or {}).get("commit_display", {}) or {}
+        self.commit_message_mode = str(
+            display_cfg.get("message_mode") or "full"
+        ).strip().lower()
+        if self.commit_message_mode not in ("full", "first_line"):
+            self.commit_message_mode = "full"
         # 单条纯文本消息安全长度：超过后自动拆分为多条发送（QQ 对单条消息长度有限制）
         self.message_max_length = int((config or {}).get("message_max_length", 2000) or 2000)
+        # Issues 评论正文最大长度（超出截断，防止单条通知过长）
+        self.max_comment_length = int((config or {}).get("max_comment_length", 400) or 400)
         # 合并转发推送相关配置（forward_merge 分组）
         forward_cfg = (config or {}).get("forward_merge", {}) or {}
         self.forward_merge_enabled = bool(forward_cfg.get("enabled", False))
@@ -192,15 +212,27 @@ class NotificationService:
         return target_str if target_str.isdigit() else None
 
     async def _send_by_session(self, session: MessageSesion, message, target_desc: str = ""):
-        """通过已构造好的会话对象发送消息（StarTools 通道，平台无关）"""
+        """通过已构造好的会话对象发送消息（StarTools 通道，平台无关）
+
+        纯文本消息超过 ``message_max_length`` 时会拆分为多条依次发送，
+        避免 QQ 单条消息过长导致整条发送失败。
+        """
         try:
             message_chain = self._to_message_chain(message)
-            sent = await StarTools.send_message(session, message_chain)
-            if not sent:
-                error_msg = f"发送消息失败: 找不到平台 {session.platform_name}，请检查平台是否已启动"
-                logger.error(error_msg)
-                return {"success": False, "message": error_msg}
-            logger.info(f"✅ 成功向 {target_desc or session.session_id} 发送消息")
+            chunks = self._split_text_chain(message_chain)
+            for chunk in chunks:
+                sent = await StarTools.send_message(session, chunk)
+                if not sent:
+                    error_msg = f"发送消息失败: 找不到平台 {session.platform_name}，请检查平台是否已启动"
+                    logger.error(error_msg)
+                    return {"success": False, "message": error_msg}
+            if len(chunks) > 1:
+                logger.info(
+                    f"✅ 成功向 {target_desc or session.session_id} 发送 "
+                    f"{len(chunks)} 条分片消息"
+                )
+            else:
+                logger.info(f"✅ 成功向 {target_desc or session.session_id} 发送消息")
             return {"success": True}
         except Exception as e:
             error_msg = f"发送消息失败: {str(e)}"
@@ -253,6 +285,8 @@ class NotificationService:
                 # 合并转发模式的重试元数据：决定该条目重试时走合并转发发送器
                 "forward_merge": bool(n.get("forward_merge", False)),
                 "forward_batch": bool(n.get("forward_batch", False)),
+                # 单次收集上限提示：重试时继续保持“更早提交未展示”的提示
+                "truncated": bool(n.get("truncated", False)),
             }
             item["key"] = n.get("key") or self._build_notification_key(repo_info, new_commits)
             item["attempts"] = int(n.get("attempts", 0) or 0)
@@ -277,6 +311,7 @@ class NotificationService:
                 n.get("group_targets", []),
             )
             existing["attempts"] = max(int(existing.get("attempts", 0) or 0), int(n.get("attempts", 0) or 0))
+            existing["truncated"] = bool(existing.get("truncated", False)) or bool(n.get("truncated", False))
             existing_created_at = existing.get("created_at")
             n_created_at = n.get("created_at")
             if isinstance(existing_created_at, str) and isinstance(n_created_at, str):
@@ -389,7 +424,10 @@ class NotificationService:
                 continue
 
             # 检查是否已经在主发送记录中标记为已发送
-            if self._is_already_sent_in_main_record(repo_info, new_commits, targets, group_targets):
+            if self._is_already_sent_in_main_record(
+                repo_info, new_commits, notification.get("branch"),
+                targets, group_targets,
+            ):
                 logger.info(f"通知 {notification_key} 已经在主记录中标记为已发送，跳过重试")
                 continue
 
@@ -399,6 +437,7 @@ class NotificationService:
                 targets,
                 group_targets,
                 branch=notification.get("branch"),
+                truncated=bool(notification.get("truncated", False)),
             )
 
             if failed_targets or failed_group_targets:
@@ -408,7 +447,10 @@ class NotificationService:
                 remaining_notifications.append(notification)
             else:
                 # 发送成功，标记为主已发送
-                self._mark_as_sent_in_main_record(repo_info, new_commits, targets, group_targets)
+                self._mark_as_sent_in_main_record(
+                    repo_info, new_commits, notification.get("branch"),
+                    targets, group_targets,
+                )
 
         # 保存仍然失败的通知
         # 合并转发重试：同一目标的多条通知重新合并成一条转发记录发送
@@ -420,8 +462,14 @@ class NotificationService:
         self._save_failed_notifications(remaining_notifications)
         logger.info(f"重试后仍失败的通知数量: {len(remaining_notifications)}")
 
-    def _is_already_sent_in_main_record(self, repo_info: Dict, new_commits: List[Dict], targets: List[str], group_targets: List[str]) -> bool:
-        """检查通知是否已经在主发送记录中"""
+    def _is_already_sent_in_main_record(self, repo_info: Dict, new_commits: List[Dict],
+                                        branch: str, targets: List[str],
+                                        group_targets: List[str]) -> bool:
+        """检查通知是否已经在主发送记录中
+
+        主记录键与 main.py 保持一致：``owner/repo/branch``。旧版重试逻辑写的是
+        ``owner/repo``，这里保留回退读取，避免升级后重复推送。
+        """
         try:
             from astrbot.core.star import StarTools
             plugin_data_dir = StarTools.get_data_dir("GitHub监控插件")
@@ -438,30 +486,32 @@ class NotificationService:
 
             owner = (repo_info.get("owner") or {}).get("login") or ""
             repo = repo_info.get("name") or ""
-            repo_key = f"{owner}/{repo}"
+            branch = str(branch or "").strip()
+            repo_key = f"{owner}/{repo}/{branch}" if branch else f"{owner}/{repo}"
 
             latest_sha = new_commits[0].get("sha", "") if new_commits else ""
             if not latest_sha:
                 return False
 
-            repo_sent_data = sent_data.get(repo_key, {})
-            commit_sent_data = repo_sent_data.get(latest_sha, [])
+            repo_sent_data = sent_data.get(repo_key)
+            if repo_sent_data is None and branch:
+                # 兼容旧版按 owner/repo 写入的记录
+                repo_sent_data = sent_data.get(f"{owner}/{repo}", {})
+            commit_sent_data = (repo_sent_data or {}).get(latest_sha, [])
 
-            # 检查是否有任何记录包含当前的目标列表
-            target_set = set(str(t) for t in targets)
-            group_set = set(str(g) for g in group_targets)
-
-            for sent_groups in commit_sent_data:
-                sent_group_set = set(str(g) for g in sent_groups)
-                # 如果当前群组列表是已发送列表的子集，认为已发送
-                if group_set.issubset(sent_group_set):
+            # 当前目标集合是任意一条已发送记录的子集，即视为已发送
+            target_set = set(combine_target_keys(targets, group_targets))
+            for sent_targets in commit_sent_data:
+                if target_set <= set(dedupe_targets(sent_targets)):
                     return True
 
             return False
         except Exception:
             return False
 
-    def _mark_as_sent_in_main_record(self, repo_info: Dict, new_commits: List[Dict], targets: List[str], group_targets: List[str]):
+    def _mark_as_sent_in_main_record(self, repo_info: Dict, new_commits: List[Dict],
+                                     branch: str, targets: List[str],
+                                     group_targets: List[str]):
         """在主发送记录中标记为已发送"""
         try:
             from astrbot.core.star import StarTools
@@ -475,7 +525,8 @@ class NotificationService:
 
             owner = (repo_info.get("owner") or {}).get("login") or ""
             repo = repo_info.get("name") or ""
-            repo_key = f"{owner}/{repo}"
+            branch = str(branch or "").strip()
+            repo_key = f"{owner}/{repo}/{branch}" if branch else f"{owner}/{repo}"
 
             latest_sha = new_commits[0].get("sha", "") if new_commits else ""
             if not latest_sha:
@@ -486,9 +537,9 @@ class NotificationService:
             if latest_sha not in sent_data[repo_key]:
                 sent_data[repo_key][latest_sha] = []
 
-            group_list = list(set(str(g) for g in group_targets))
-            if group_list and group_list not in sent_data[repo_key][latest_sha]:
-                sent_data[repo_key][latest_sha].append(group_list)
+            combined = combine_target_keys(targets, group_targets)
+            if combined not in sent_data[repo_key][latest_sha]:
+                sent_data[repo_key][latest_sha].append(combined)
 
             write_json_atomic(sent_file, sent_data)
         except Exception as e:
@@ -533,6 +584,7 @@ class NotificationService:
                 "targets": targets,
                 "group_targets": group_targets,
                 "branch": item.get("branch"),
+                "truncated": bool(item.get("truncated", False)),
                 "failed_targets": [],
                 "failed_group_targets": [],
             })
@@ -557,7 +609,7 @@ class NotificationService:
 
     def queue_commit_notification(self, repo_info: Dict, new_commits: List[Dict],
                                   targets=None, group_targets=None, branch: str = None,
-                                  repo_key: str = None):
+                                  repo_key: str = None, truncated: bool = False):
         """把本轮检测到的 commit 通知放入待合并队列（不立即发送）。
 
         合并转发模式下，一次轮询中所有仓库的 commit 通知都会先入队，待本轮
@@ -595,6 +647,7 @@ class NotificationService:
             "targets": self._merge_unique(self._normalize_target_list(targets), []),
             "group_targets": self._merge_unique(self._normalize_target_list(group_targets), []),
             "branch": branch,
+            "truncated": bool(truncated),
             "failed_targets": [],
             "failed_group_targets": [],
         })
@@ -653,6 +706,7 @@ class NotificationService:
                 "forward_merge": True,
                 "forward_batch": True,
                 "branch": item["branch"],
+                "truncated": bool(item.get("truncated", False)),
                 "key": self._build_notification_key(item["repo_info"], item["new_commits"]),
                 "attempts": 1,
                 "created_at": datetime.utcnow().isoformat(),
@@ -767,6 +821,7 @@ class NotificationService:
                 self._mark_as_sent_in_main_record(
                     entry.get("repo_info", {}),
                     entry.get("new_commits", []),
+                    entry.get("branch"),
                     entry.get("targets", []),
                     entry.get("group_targets", []),
                 )
@@ -815,14 +870,20 @@ class NotificationService:
 
     async def _build_forward_node_content(self, item: Dict) -> List:
         """构建单个转发节点的内容（文字或图片卡片），渲染失败时回退为文字节点"""
+        truncated = bool(item.get("truncated", False))
         if self._resolve_forward_content_mode() == "image":
             image_b64 = await self._render_commit_card_image(
-                item["repo_info"], item["new_commits"], item.get("branch")
+                item["repo_info"], item["new_commits"], item.get("branch"),
+                truncated=truncated,
             )
             if image_b64:
                 return [Comp.Image.fromBase64(image_b64)]
             logger.warning("合并转发：图片卡片渲染失败，该节点回退为文字消息")
-        return [Comp.Plain(self._format_commit_message(item["repo_info"], item["new_commits"]))]
+        return [Comp.Plain(
+            self._format_commit_message(
+                item["repo_info"], item["new_commits"], truncated=truncated
+            )
+        )]
 
     def _resolve_forward_content_mode(self) -> str:
         """解析合并转发节点内容形式：follow 时跟随 commit_output_format"""
@@ -831,13 +892,16 @@ class NotificationService:
         return "image" if self.forward_content_mode == "image" else "text"
 
     async def _render_commit_card_image(self, repo_info: Dict, new_commits: List[Dict],
-                                        branch: str = None) -> Optional[str]:
+                                        branch: str = None,
+                                        truncated: bool = False) -> Optional[str]:
         """渲染 commit 图片卡片，返回 base64 字符串；渲染失败返回 None"""
         if not self.image_service:
             logger.error("文转图服务未注入，无法渲染 commit 卡片")
             return None
         try:
-            return await self.image_service.render_commit_image(repo_info, new_commits, branch)
+            return await self.image_service.render_commit_image(
+                repo_info, new_commits, branch, truncated=truncated
+            )
         except Exception as e:
             logger.error(f"渲染 commit 卡片图片失败: {str(e)}")
             return None
@@ -887,12 +951,15 @@ class NotificationService:
         """
         repo_info = item["repo_info"]
         new_commits = item["new_commits"]
+        truncated = bool(item.get("truncated", False))
 
         if self.commit_output_format != "image":
-            return self._format_commit_message(repo_info, new_commits), None, None
+            return self._format_commit_message(
+                repo_info, new_commits, truncated=truncated
+            ), None, None
 
         image_b64 = await self._render_commit_card_image(
-            repo_info, new_commits, item.get("branch")
+            repo_info, new_commits, item.get("branch"), truncated=truncated
         )
         if not image_b64:
             return None, None, None
@@ -934,12 +1001,19 @@ class NotificationService:
                 and getattr(Comp, "Nodes", None) is not None)
 
     async def send_commit_notification(self, repo_info: Dict, new_commits: List[Dict], targets: List[str],
-                                       group_targets: List[str] = None, branch: str = None):
-        """发送commit变更通知"""
+                                       group_targets: List[str] = None, branch: str = None,
+                                       truncated: bool = False) -> tuple[List[str], List[str]]:
+        """发送commit变更通知
+
+        Returns:
+            (发送失败的私聊目标, 发送失败的群聊目标)。调用方据此只把成功
+            目标写入主发送记录，失败目标交给待重试队列，避免“标记全部已发
+            送”导致失败目标永远不会被重试。
+        """
         # 检查是否有有效的提交
         if not new_commits:
             logger.info("没有新的提交需要通知")
-            return
+            return [], []
 
         try:
             failed_targets, failed_group_targets = await self._send_notification_collect_failures(
@@ -948,6 +1022,7 @@ class NotificationService:
                 targets,
                 group_targets,
                 branch=branch,
+                truncated=truncated,
             )
 
             if failed_targets or failed_group_targets:
@@ -959,6 +1034,7 @@ class NotificationService:
                         "targets": failed_targets,
                         "group_targets": failed_group_targets,
                         "branch": branch,
+                        "truncated": bool(truncated),
                         "key": self._build_notification_key(repo_info, new_commits),
                         "attempts": 1,
                         "created_at": datetime.utcnow().isoformat(),
@@ -966,18 +1042,22 @@ class NotificationService:
                 )
                 self._save_failed_notifications(failed_notifications)
                 logger.warning("部分通知发送失败，已保存到待重试列表")
+            return failed_targets, failed_group_targets
         except Exception as e:
             logger.error(f"发送通知失败: {str(e)}")
             # 保存到失败列表中
             try:
+                failed_targets = self._normalize_target_list(targets)
+                failed_group_targets = self._normalize_target_list(group_targets)
                 failed_notifications = self._load_failed_notifications()
                 failed_notifications.append(
                     {
                         "repo_info": repo_info,
                         "new_commits": new_commits,
-                        "targets": self._normalize_target_list(targets),
-                        "group_targets": self._normalize_target_list(group_targets),
+                        "targets": failed_targets,
+                        "group_targets": failed_group_targets,
                         "branch": branch,
+                        "truncated": bool(truncated),
                         "key": self._build_notification_key(repo_info, new_commits),
                         "attempts": 1,
                         "created_at": datetime.utcnow().isoformat(),
@@ -987,6 +1067,7 @@ class NotificationService:
                 logger.warning("通知发送异常，已保存到待重试列表")
             except Exception as save_error:
                 logger.error(f"保存失败通知记录也失败了: {str(save_error)}")
+            return self._normalize_target_list(targets), self._normalize_target_list(group_targets)
 
     async def _send_notification_collect_failures(
         self,
@@ -995,16 +1076,21 @@ class NotificationService:
         targets,
         group_targets=None,
         branch: str = None,
+        truncated: bool = False,
     ) -> tuple[List[str], List[str]]:
         try:
-            text_message = self._format_commit_message(repo_info, new_commits)
+            text_message = self._format_commit_message(
+                repo_info, new_commits, truncated=truncated
+            )
             message: str | MessageChain = text_message
             image_b64: Optional[str] = None
             temp_image_path: Optional[str] = None
 
             # 文转图模式：渲染 commit 卡片（渲染一次，所有目标复用）
             if self.commit_output_format == "image":
-                image_b64 = await self._render_commit_card_image(repo_info, new_commits, branch)
+                image_b64 = await self._render_commit_card_image(
+                    repo_info, new_commits, branch, truncated=truncated
+                )
                 if image_b64:
                     temp_image_path = self._write_temp_image(image_b64)
                     message = self._build_image_chain(image_b64, temp_image_path)
@@ -1072,6 +1158,303 @@ class NotificationService:
         except Exception as e:
             logger.error(f"发送通知时发生异常: {str(e)}")
             return self._normalize_target_list(targets), self._normalize_target_list(group_targets)
+
+    # ------------------------------------------------------------------
+    # Issues 增量通知（文本卡 / 图片卡）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_issue_labels(labels) -> str:
+        """格式化 Issue 标签，无标签时返回空串"""
+        if not labels:
+            return ""
+        return " 🏷️ " + ",".join(str(label) for label in labels)
+
+    def _issue_details(self, issue: Dict, status: str = "open",
+                       changes: Optional[List[str]] = None) -> str:
+        """生成 Issue 状态行：标签、评论数、状态、变更摘要"""
+        parts = []
+        if issue.get("labels"):
+            parts.append("🏷️ " + ",".join(str(label) for label in issue["labels"]))
+        parts.append(f"💬 {int(issue.get('comments', 0) or 0)} 条评论")
+        parts.append(f"状态: {status}")
+        if changes:
+            parts.append("🔧 " + "；".join(changes))
+        return " · ".join(parts)
+
+    def _format_issue_message(self, repo_name: str, new_issues: List[Dict],
+                              updated_issues: List[Dict],
+                              closed_issues: List[Dict]) -> tuple[str, List[str]]:
+        """格式化 Issues 增量文本卡，返回 (文本, 评论图片 URL 列表)"""
+        message = f"📋 Issues 增量 - {repo_name}\n\n"
+        issue_images: List[str] = []
+
+        for issue in new_issues:
+            message += (
+                f"🆕 新增 Issue #{issue['number']} {issue['title']}"
+                f"{self._format_issue_labels(issue.get('labels'))}\n"
+            )
+            message += (
+                f"   👤 {issue['author']} | 💬 {int(issue.get('comments', 0) or 0)} 条评论"
+                f" | 状态: open | 🔗 {issue['url']}\n\n"
+            )
+
+        for item in updated_issues:
+            issue = item["issue"]
+            new_comments = item.get("new_comments", [])
+            changes = item.get("changes", [])
+            if new_comments:
+                message += (
+                    f"💬 Issue #{issue['number']} {issue['title']} 有新讨论"
+                    f"（+{len(new_comments)} 条评论，共 {int(issue.get('comments', 0) or 0)} 条）\n"
+                )
+                for comment in new_comments[:3]:
+                    body_text, image_urls = extract_image_urls(comment.get("body", ""))
+                    body_text = truncate_text(body_text, self.max_comment_length)
+                    for url in image_urls:
+                        if (url not in issue_images
+                                and len(issue_images) < MAX_ISSUE_IMAGES_PER_PUSH):
+                            issue_images.append(url)
+                    message += f"   └ {comment['author']}:\n{body_text}\n\n"
+                if len(new_comments) > 3:
+                    message += f"   └ ...另有 {len(new_comments) - 3} 条新评论\n"
+            else:
+                message += f"🔄 Issue #{issue['number']} {issue['title']} 有更新\n"
+            if changes:
+                message += "   🔧 " + "；".join(changes) + "\n"
+            message += f"   {self._issue_details(issue, 'open')}\n"
+            message += f"   🔗 {issue['url']}\n\n"
+
+        for issue in closed_issues:
+            message += f"✅ Issue #{issue['number']} {issue['title']} 已关闭\n"
+            message += (
+                f"   👤 {issue.get('author', '未知作者')} | "
+                f"{self._issue_details(issue, 'closed')} | 🔗 {issue.get('url', '')}\n\n"
+            )
+
+        message += (
+            f"📊 本轮：新增 {len(new_issues)} 个，{len(updated_issues)} 个有动态，"
+            f"{len(closed_issues)} 个已关闭"
+        )
+        return message, issue_images
+
+    def build_issue_render_data(self, repo_info: Dict, new_issues: List[Dict],
+                                updated_issues: List[Dict], closed_issues: List[Dict],
+                                branch: str = None) -> Dict:
+        """组装 Issues 图片卡片的模板上下文（复用 commit_card.html）"""
+        owner = (repo_info.get("owner") or {}).get("login") or ""
+        repo = repo_info.get("name") or ""
+        events: List[Dict] = []
+
+        for issue in new_issues:
+            events.append({
+                "sha_short": f"#{issue['number']}",
+                "message": f"🆕 新增 Issue: {issue['title']}",
+                "author": issue.get("author", ""),
+                "time": issue.get("updated_at", ""),
+                "url": issue.get("url", ""),
+                "details": self._issue_details(issue, "open"),
+            })
+
+        for item in updated_issues:
+            issue = item["issue"]
+            new_comments = item.get("new_comments", [])
+            changes = item.get("changes", [])
+            if new_comments:
+                first = new_comments[0]
+                preview, _ = extract_image_urls(first.get("body", ""))
+                preview = truncate_text(preview, self.max_comment_length)
+                message_text = (
+                    f"💬 有新讨论（+{len(new_comments)} 条评论）: {issue['title']}"
+                )
+                if preview:
+                    message_text += f"\n   └ {first.get('author', '')}: {preview}"
+                author = first.get("author", issue.get("author", ""))
+                time_value = first.get("created_at", issue.get("updated_at", ""))
+            else:
+                message_text = f"🔄 Issue 有更新: {issue['title']}"
+                author = issue.get("author", "")
+                time_value = issue.get("updated_at", "")
+            events.append({
+                "sha_short": f"#{issue['number']}",
+                "message": message_text,
+                "author": author,
+                "time": time_value,
+                "url": issue.get("url", ""),
+                "details": self._issue_details(issue, "open", changes),
+            })
+
+        for issue in closed_issues:
+            events.append({
+                "sha_short": f"#{issue['number']}",
+                "message": f"✅ Issue 已关闭: {issue['title']}",
+                "author": issue.get("author", ""),
+                "time": issue.get("updated_at", ""),
+                "url": issue.get("url", ""),
+                "details": self._issue_details(issue, "closed"),
+            })
+
+        for event in events:
+            formatted = format_commit_datetime(
+                event.get("time", ""), self.time_zone, self.time_format
+            )
+            if formatted:
+                event["time"] = formatted
+
+        try:
+            generated_at = datetime.now(ZoneInfo(self.time_zone)).strftime(
+                self.time_format
+            )
+        except Exception:
+            generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        return {
+            "title": "GitHub Issues 增量通知",
+            "repo_name": f"{owner}/{repo}",
+            "repo_url": repo_info.get("html_url", ""),
+            "branch": branch,
+            "commit_count": len(events),
+            "count_text": f"{len(events)} 个 Issues 动态",
+            "commits": events,
+            "has_total_stats": False,
+            "total_additions": 0,
+            "total_deletions": 0,
+            "summary_text": (
+                f"📊 新增 {len(new_issues)} 个，{len(updated_issues)} 个有动态，"
+                f"{len(closed_issues)} 个已关闭"
+            ),
+            "generated_at": generated_at,
+            "truncated": False,
+        }
+
+    async def _render_issue_card_image(self, repo_info: Dict, new_issues: List[Dict],
+                                       updated_issues: List[Dict], closed_issues: List[Dict],
+                                       branch: str = None) -> Optional[str]:
+        """渲染 Issues 图片卡片，返回 base64；渲染失败返回 None"""
+        if not self.image_service:
+            logger.error("文转图服务未注入，无法渲染 Issues 卡片")
+            return None
+        try:
+            data = self.build_issue_render_data(
+                repo_info, new_issues, updated_issues, closed_issues, branch
+            )
+            return await self.image_service.render_data(data)
+        except Exception as e:
+            logger.error(f"渲染 Issues 卡片图片失败: {str(e)}")
+            return None
+
+    @staticmethod
+    def _build_issue_image_filename(repo_info: Dict) -> str:
+        owner = (repo_info.get("owner") or {}).get("login") or "unknown"
+        repo = repo_info.get("name") or "unknown"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"github_issues_{owner}_{repo}_{timestamp}.png"
+
+    def _build_issue_text_payloads(self, text_message: str, issue_images: List[str]) -> List:
+        """构建 Issues 文本卡的发送载荷
+
+        无图片时直接返回文本（由发送通道按 message_max_length 自动拆分）；
+        有图片时先按安全长度拆分文本，把图片追加到最后一条，避免一条超长
+        图文消息导致整条发送失败。
+        """
+        if not issue_images:
+            return [text_message]
+        try:
+            chunks = split_long_message(text_message, self.message_max_length)
+            payloads = []
+            for index, chunk in enumerate(chunks):
+                chain = [Comp.Plain(chunk)]
+                if index == len(chunks) - 1:
+                    chain.extend(Comp.Image.fromURL(url) for url in issue_images)
+                payloads.append(MessageChain(chain=chain))
+            return payloads
+        except Exception as e:
+            logger.warning(f"Issues 图文消息链构造失败，仅发送文本: {str(e)}")
+            return [text_message]
+
+    async def send_issue_notification(self, repo_info: Dict, new_issues: List[Dict],
+                                      updated_issues: List[Dict], closed_issues: List[Dict],
+                                      private_targets: List[str], group_targets: List[str],
+                                      branch: str = None):
+        """发送 Issues 增量通知（每仓库一轮一条文本卡或图片卡）"""
+        if not new_issues and not updated_issues and not closed_issues:
+            return
+
+        owner = (repo_info.get("owner") or {}).get("login") or ""
+        repo = repo_info.get("name") or ""
+        repo_name = f"{owner}/{repo}"
+
+        text_message, issue_images = self._format_issue_message(
+            repo_name, new_issues, updated_issues, closed_issues
+        )
+
+        image_b64: Optional[str] = None
+        temp_image_path: Optional[str] = None
+
+        if self.issue_output_format == "image":
+            image_b64 = await self._render_issue_card_image(
+                repo_info, new_issues, updated_issues, closed_issues, branch
+            )
+            if image_b64:
+                temp_image_path = self._write_temp_image(image_b64)
+                payloads = [self._build_image_chain(image_b64, temp_image_path)]
+            else:
+                logger.warning("Issues 图片卡片渲染失败，降级为文本卡")
+                payloads = self._build_issue_text_payloads(text_message, issue_images)
+        else:
+            payloads = self._build_issue_text_payloads(text_message, issue_images)
+
+        try:
+            for target in dedupe_targets(private_targets):
+                try:
+                    sent_ok = True
+                    for payload in payloads:
+                        result = await self._send_to_target(
+                            target, False, payload, image_b64, temp_image_path
+                        )
+                        if not result.get("success", False):
+                            sent_ok = False
+                            break
+                    if sent_ok:
+                        logger.info(f"Issues 增量通知：私聊成功发送给 {target}")
+                    else:
+                        logger.warning(f"Issues 增量通知：私聊发送给 {target} 失败")
+                except Exception as e:
+                    logger.error(f"Issues 增量通知：私聊发送给 {target} 出错: {str(e)}")
+
+            for group_target in dedupe_targets(group_targets):
+                try:
+                    sent_ok = True
+                    for payload in payloads:
+                        result = await self._send_to_target(
+                            group_target, True, payload, image_b64, temp_image_path
+                        )
+                        if not result.get("success", False):
+                            sent_ok = False
+                            break
+                    if not sent_ok:
+                        logger.warning(f"Issues 增量通知：群消息发送给 {group_target} 失败")
+                        continue
+                    logger.info(f"Issues 增量通知：群消息成功发送给 {group_target}")
+                    if image_b64 and self.upload_service:
+                        upload_id = self._resolve_onebot_digit_id(group_target)
+                        if upload_id is not None:
+                            try:
+                                await self.upload_service.maybe_upload(
+                                    upload_id,
+                                    image_b64,
+                                    self._build_issue_image_filename(repo_info),
+                                )
+                            except Exception as e:
+                                logger.error(f"Issues 图片上传群文件/相册出错: {str(e)}")
+                except Exception as e:
+                    logger.error(f"Issues 增量通知：群消息发送给 {group_target} 出错: {str(e)}")
+        finally:
+            if temp_image_path:
+                try:
+                    os.remove(temp_image_path)
+                except OSError:
+                    pass
 
     async def _send_to_target(
         self,
@@ -1178,11 +1561,12 @@ class NotificationService:
             return None
         return {"additions": additions, "deletions": deletions, "counted": counted}
 
-    def _format_commit_message(self, repo_info: Dict, new_commits: List[Dict]) -> str:
+    def _format_commit_message(self, repo_info: Dict, new_commits: List[Dict],
+                               truncated: bool = False) -> str:
         """格式化commit消息"""
         repo_name = f"{repo_info['owner']['login']}/{repo_info['name']}"
 
-        message = f"🔔 GitHub仓库更新通知\n\n"
+        message = "🔔 GitHub仓库更新通知\n\n"
         message += f"📁 仓库: {repo_name}\n"
         message += f"🔗 链接: {repo_info['html_url']}\n\n"
 
@@ -1194,7 +1578,7 @@ class NotificationService:
                 self.time_zone,
                 self.time_format,
             )
-            message += f"✨ 新Commit:\n"
+            message += "✨ 新Commit:\n"
             message += f"📝 SHA: {commit['sha'][:7]}\n"
             message += f"👤 作者: {commit['author']}\n"
             if formatted_date:
@@ -1205,7 +1589,10 @@ class NotificationService:
             stats_line = self._format_commit_stats(commit)
             if stats_line:
                 message += f"{stats_line}\n"
-            message += f"💬 信息: {commit['message']}\n"
+            display_message = commit_message_for_display(
+                commit.get("message", ""), self.commit_message_mode
+            ) or "(无提交信息)"
+            message += f"💬 信息: {display_message}\n"
             message += f"🔗 链接: {commit['url']}\n\n"
         else:
             # 有多个提交的格式
@@ -1226,13 +1613,19 @@ class NotificationService:
                 stats_line = self._format_commit_stats(commit)
                 if stats_line:
                     message += f"   {stats_line}\n"
-                message += f"   💬 信息: {commit['message']}\n"
+                display_message = commit_message_for_display(
+                    commit.get("message", ""), self.commit_message_mode
+                ) or "(无提交信息)"
+                message += f"   💬 信息: {display_message}\n"
                 message += f"   🔗 链接: {commit['url']}\n\n"
 
             # 多个提交时汇总增删行数（单提交的统计已在上方单独展示，不重复）
             summary = self._sum_commit_stats(new_commits)
             if summary:
                 message += f"📊 本轮总计: +{summary['additions']} -{summary['deletions']}\n"
+
+        if truncated:
+            message += "\n⚠️ 提交数量达到单次收集上限，更早的提交未展示\n"
 
         return message
 

@@ -108,7 +108,9 @@
     color: #eef3f8;
     word-break: break-word;
     overflow-wrap: anywhere;
+    white-space: pre-wrap;
   }
+  .details { font-size: 12px; color: #7a8398; margin-top: 3px; }
   .meta { font-size: 12px; margin-top: 3px; }
   .meta .author { color: #66ccff; }
   .meta .time { color: #7a8398; margin-left: 8px; }
@@ -168,7 +170,7 @@
       <div class="sub-row">
         <a class="repo-link" href="{{ repo_url or '#' }}">{{ repo_name or '未知仓库' }}</a>
         {% if branch %}<span class="branch-tag">{{ branch }}</span>{% endif %}
-        <span class="count-badge">{{ commit_count or 0 }} 个新提交</span>
+        <span class="count-badge">{{ count_text or ((commit_count or 0) ~ ' 个新提交') }}</span>
       </div>
     </div>
     <!-- Q 版初音未来立绘（内联 SVG） -->
@@ -236,18 +238,21 @@
       <div class="msg-wrap">
         <div class="message">{{ c.message or '(无提交信息)' }}</div>
         <div class="meta"><span class="author">{{ c.author or '未知作者' }}</span><span class="time">{{ c.time or '' }}</span></div>
+        {% if c.details %}<div class="details">{{ c.details }}</div>{% endif %}
         {% if c.has_stats %}<div class="stats"><span class="add">+{{ c.stats_additions or 0 }}</span> <span class="del">-{{ c.stats_deletions or 0 }}</span>{% if c.stats_files is not none %}<span class="files">{{ c.stats_files }} 个文件</span>{% endif %}</div>{% endif %}
       </div>
     </div>
     {% else %}
     <div class="empty">♪ 暂无新提交 ♪</div>
     {% endfor %}
-    {% if has_total_stats %}
+    {% if summary_text %}
+    <div class="summary">{{ summary_text }}</div>
+    {% elif has_total_stats %}
     <div class="summary">♪ 本轮总计<span class="add">+{{ total_additions }}</span><span class="del">-{{ total_deletions }}</span></div>
     {% endif %}
   </div>
   <div class="footer">
-    <span>更新时间：{{ generated_at or '未知' }}</span>
+    <span>更新时间：{{ generated_at or '未知' }}{% if truncated %} · ⚠️ 更早提交未展示{% endif %}</span>
     <span class="sig">39 ♪ 感谢聆听</span>
   </div>
 </div>

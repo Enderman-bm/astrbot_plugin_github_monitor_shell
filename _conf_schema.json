@@ -9,12 +9,26 @@
     "type": "list",
     "description": "要监控的仓库列表，支持两种格式：1.字符串格式 2.字典格式 ",
     "default": [],
-    "hint": "例如:1592363624/astrbot_plugin_github_monitor_shell|123456|91219736 或 {\"owner\": \"1592363624\", \"repo\": \"astrbot_plugin_github_monitor_shell\", \"groups\": [\"123456\", \"91219736\"]}。群号也支持 UMO 格式（平台ID:消息类型:会话ID）"
+    "hint": "例如:1592363624/astrbot_plugin_github_monitor_shell|123456|91219736 或 {\"owner\": \"1592363624\", \"repo\": \"astrbot_plugin_github_monitor_shell\", \"groups\": [\"123456\"], \"notification_targets\": [\"10001\"], \"exclusive\": true}。群号/私聊目标也支持 UMO 格式（平台ID:消息类型:会话ID）。exclusive 为 true 时该仓库不再叠加全局通知目标，实现仓库级分流"
   },
   "check_interval": {
     "type": "int",
     "description": "检查间隔（分钟）",
     "default": 60
+  },
+  "commit_fetch": {
+    "type": "object",
+    "description": "Commit 收集设置",
+    "hint": "控制单次检查从 GitHub 收集多少个新提交。插件会分页拉取，直到找到上次记录的提交或达到上限；超过上限的提交不会补发，会在通知中提示。",
+    "items": {
+      "max_commits": {
+        "type": "int",
+        "description": "单次检查最多收集的提交数",
+        "default": 50,
+        "hint": "默认 50，范围 1-500。调大可减少高频仓库丢提交的概率，但会增加 GitHub API 请求次数；调小则更容易在两次检查之间截断",
+        "slider": {"min": 1, "max": 500, "step": 1}
+      }
+    }
   },
   "notification_targets": {
     "type": "list",
@@ -26,7 +40,7 @@
     "type": "list",
     "description": "全局群通知目标",
     "default": [],
-    "hint": "所有仓库更新时都会通知这些群组，如果需要为特定仓库配置额外的群组，请在仓库配置中指定。支持两种格式：1.纯数字群号，如 123456；2.UMO 格式：平台ID:GroupMessage:会话ID，如 aiocqhttp:GroupMessage:123456 或 小爱同学:GroupMessage:0771687B325FC423AD9F4C06A88D84E3（推荐，适配QQ官方机器人的十六进制openid及多bot场景）"
+    "hint": "所有仓库更新时都会通知这些群组（仓库配置 exclusive=true 时除外）。如果需要为特定仓库配置额外的群组，请在仓库配置中指定。支持两种格式：1.纯数字群号，如 123456；2.UMO 格式：平台ID:GroupMessage:会话ID，如 aiocqhttp:GroupMessage:123456 或 小爱同学:GroupMessage:0771687B325FC423AD9F4C06A88D84E3（推荐，适配QQ官方机器人的十六进制openid及多bot场景）"
   },
   "platform_id": {
     "type": "string",
@@ -48,27 +62,9 @@
   },
   "issue_monitor_enabled": {
     "type": "bool",
-    "description": "是否监控项目仓库的 Issues 动态",
+    "description": "是否监控项目仓库的 Issues 增量动态",
     "default": true,
-    "hint": "开启后，随每次仓库检查一同检测上方配置的监控仓库的 Issues：有新增 Issue、或 Issue 下出现新评论（讨论变化）时立即推送通知，推送目标与 Commit 通知一致"
-  },
-  "issues_cron_enabled": {
-    "type": "bool",
-    "description": "是否启用 Issues 定时推送",
-    "default": false,
-    "hint": "开启后，将按照 cron 表达式自动查询所有仓库的 open issues 并私聊发送给通知目标"
-  },
-  "issues_cron_expression": {
-    "type": "string",
-    "description": "Issues 定时推送的 Cron 表达式",
-    "default": "0 9 * * *",
-    "hint": "标准 5 段 Cron 表达式（分 时 日 月 周），例如: 0 9 * * * 表示每天 9:00 推送，0 9 * * 1-5 表示工作日 9:00 推送"
-  },
-  "issues_push_min_interval": {
-    "type": "int",
-    "description": "Issues 推送最小间隔（分钟）",
-    "default": 60,
-    "hint": "相同内容的推送不会在此间隔内重复发送，防止短时间内重复推送"
+    "hint": "开启后，随每次仓库检查一同检测上方配置的监控仓库的 Issues：新增 Issue、Issue 新评论、标题/标签变化、Issue 被关闭时立即推送增量通知，推送目标与 Commit 通知一致（遵循仓库级分流）。不再使用 cron 定时汇总"
   },
   "max_comment_length": {
     "type": "int",
@@ -80,7 +76,21 @@
     "type": "int",
     "description": "单条消息安全长度（字符）",
     "default": 2000,
-    "hint": "超过该长度的纯文本通知会自动拆分为多条消息依次发送（QQ 对单条消息长度有限制，过长会导致整条发送失败）。推送通知与命令查询回复均生效"
+    "hint": "超过该长度的纯文本通知会自动拆分为多条消息依次发送（QQ 对单条消息长度有限制，过长会导致整条发送失败）。Commit 文本通知、Issues 文本通知与命令查询回复均生效"
+  },
+  "commit_display": {
+    "type": "object",
+    "description": "Commit 信息展示",
+    "hint": "控制文本通知、图片卡片和合并转发节点中 commit message 的展示方式",
+    "items": {
+      "message_mode": {
+        "type": "string",
+        "description": "Commit message 展示方式",
+        "options": ["full", "first_line"],
+        "default": "full",
+        "hint": "full：完整展示提交信息（保留正文换行）；first_line：仅展示第一行（提交标题）。文本、图片卡片、合并转发节点同步生效"
+      }
+    }
   },
   "commit_stats": {
     "type": "object",
@@ -97,7 +107,7 @@
         "type": "int",
         "description": "单次通知最多统计的提交数",
         "default": 10,
-        "hint": "一次检测到多个新提交时，最多为前 N 个提交补全统计信息，避免一次轮询产生过多 API 请求；填 0 表示不统计",
+        "hint": "一次检测到多个新提交时，最多为前 N 个提交补全统计信息，避免一次轮询产生过多 API 请求；填 0 表示不统计。注意这是统计补全上限，与 commit_fetch.max_commits 的收集上限相互独立",
         "slider": {"min": 0, "max": 50, "step": 1}
       }
     }
@@ -105,7 +115,7 @@
   "image_output": {
     "type": "object",
     "description": "文转图（图片通知）",
-    "hint": "将 commit 更新通知渲染为图片卡片发送，依赖 AstrBot 的文转图（T2I）服务",
+    "hint": "将 Commit / Issues 增量通知渲染为图片卡片发送，依赖 AstrBot 的文转图（T2I）服务",
     "items": {
       "commit_output_format": {
         "type": "string",
@@ -114,12 +124,19 @@
         "default": "text",
         "hint": "text 为纯文本通知；image 会将 commit 更新渲染为图片卡片发送，渲染或发送失败的通知会进入重试队列自动重试"
       },
+      "issue_output_format": {
+        "type": "string",
+        "description": "Issues 增量通知输出格式",
+        "options": ["text", "image"],
+        "default": "text",
+        "hint": "text 为结构化文本卡；image 会将每仓库每轮的 Issues 增量（新增/更新/关闭）渲染为图片卡片。图片模式复用下方 commit 卡片模板主题，渲染失败自动降级为文本卡"
+      },
       "commit_image_template": {
         "type": "string",
-        "description": "Commit 卡片图片模板",
+        "description": "Commit / Issues 卡片图片模板",
         "options": ["random", "terminal", "github_dark", "light", "retro_term", "miku", "sakura"],
         "default": "terminal",
-        "hint": "内置主题：terminal 终端风 / github_dark GitHub暗色 / light 简洁浅色 / retro_term 复古绿屏 / miku 初音风 / sakura 樱花粉；选 random 则每次推送随机使用一套。也可以在插件数据目录的 templates/ 下放置自定义 .html 模板，文件名（不含后缀）即模板名，直接填在这里即可使用（自定义模板也会进入 random 的随机池）"
+        "hint": "内置主题：terminal 终端风 / github_dark GitHub暗色 / light 简洁浅色 / retro_term 复古绿屏 / miku 初音风 / sakura 樱花粉；选 random 则每次推送随机使用一套。Commit 与 Issues 图片卡片共用该模板配置。也可以在插件数据目录的 templates/ 下放置自定义 .html 模板，文件名（不含后缀）即模板名，直接填在这里即可使用（自定义模板也会进入 random 的随机池）"
       },
       "enable_base64_image": {
         "type": "bool",

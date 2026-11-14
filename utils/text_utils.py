@@ -1,7 +1,8 @@
-"""文本工具：长文本截断与消息分片
+"""文本工具：Commit message 展示、长文本截断与消息分片
 
 QQ（OneBot/NapCat/Lagrange 等实现）对单条文本消息长度有限制，
-内容过长会导致整条消息发送失败，因此提供截断与分片两个工具。
+内容过长会导致整条消息发送失败，因此提供截断与分片工具；
+同时提供 Commit message 的 full / first_line 展示转换。
 """
 
 from typing import List
@@ -13,6 +14,34 @@ def truncate_text(text: str, max_length: int, suffix: str = "\n…（内容过�
     if max_length <= 0 or len(text) <= max_length:
         return text
     return text[:max_length].rstrip() + suffix
+
+
+def normalize_commit_message(text: str) -> str:
+    """统一换行符并去掉首尾空白，保留正文内部换行"""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return text.strip()
+
+
+def commit_message_first_line(text: str) -> str:
+    """取 commit message 的第一行（第一个非空行），即提交标题"""
+    normalized = normalize_commit_message(text)
+    for line in normalized.split("\n"):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def commit_message_for_display(text: str, mode: str = "full") -> str:
+    """按展示模式返回 commit message
+
+    mode:
+    - full: 完整 message（保留正文换行）
+    - first_line: 只保留第一行（提交标题）
+    """
+    normalized = normalize_commit_message(text)
+    if str(mode).strip().lower() == "first_line":
+        return commit_message_first_line(normalized)
+    return normalized
 
 
 def split_long_message(text: str, max_length: int) -> List[str]:

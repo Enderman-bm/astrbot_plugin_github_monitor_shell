@@ -14,6 +14,11 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
+from ..utils.text_utils import (
+    commit_message_first_line,
+    commit_message_for_display,
+    normalize_commit_message,
+)
 from ..utils.time_utils import format_commit_datetime
 
 logger = logging.getLogger("github_monitor.image_render")
@@ -44,6 +49,12 @@ class ImageRenderService:
         config = config or {}
         image_cfg = config.get("image_output", {}) or {}
         self.template_name = image_cfg.get("commit_image_template", "terminal")
+        display_cfg = config.get("commit_display", {}) or {}
+        self.message_mode = str(
+            display_cfg.get("message_mode") or "full"
+        ).strip().lower()
+        if self.message_mode not in ("full", "first_line"):
+            self.message_mode = "full"
         self.t2i_image_type = image_cfg.get("t2i_image_type", "png")
         self.t2i_quality = int(image_cfg.get("t2i_quality", 90) or 90)
         self.t2i_scale = image_cfg.get("t2i_scale", "high")
@@ -54,7 +65,8 @@ class ImageRenderService:
         return callable(self.html_render_func)
 
     def build_render_data(
-        self, repo_info: Dict, new_commits: List[Dict], branch: Optional[str] = None
+        self, repo_info: Dict, new_commits: List[Dict], branch: Optional[str] = None,
+        truncated: bool = False,
     ) -> Dict:
         """组装模板上下文数据"""
         owner = (repo_info.get("owner") or {}).get("login") or ""
@@ -66,10 +78,17 @@ class ImageRenderService:
                 commit.get("date", ""), self.time_zone, self.time_format
             )
             stats = commit.get("stats") or {}
+            message_full = normalize_commit_message(commit.get("message", ""))
+            message_first_line = commit_message_first_line(message_full)
             commits.append(
                 {
                     "sha_short": (commit.get("sha") or "")[:7],
-                    "message": commit.get("message", ""),
+                    # message 跟随配置，自定义模板旧变量继续可用
+                    "message": commit_message_for_display(
+                        message_full, self.message_mode
+                    ),
+                    "message_full": message_full,
+                    "message_first_line": message_first_line,
                     "author": commit.get("author", ""),
                     "time": formatted or commit.get("date", ""),
                     "url": commit.get("url", ""),
@@ -103,10 +122,14 @@ class ImageRenderService:
             "repo_url": repo_info.get("html_url", ""),
             "branch": branch,
             "commit_count": len(commits),
+            # 共用 commit_card.html：Issues 卡片会传 count_text / summary_text
+            "count_text": "",
+            "summary_text": "",
             "has_total_stats": has_total_stats,
             "total_additions": total_additions,
             "total_deletions": total_deletions,
             "generated_at": generated_at,
+            "truncated": bool(truncated),
             "commits": commits,
         }
 
@@ -155,24 +178,32 @@ class ImageRenderService:
         return None
 
     async def render_commit_image(
-        self, repo_info: Dict, new_commits: List[Dict], branch: Optional[str] = None
+        self, repo_info: Dict, new_commits: List[Dict], branch: Optional[str] = None,
+        truncated: bool = False,
     ) -> Optional[str]:
         """渲染 commit 卡片，成功返回 base64 字符串，失败返回 None（调用方计入重试队列）"""
+        data = self.build_render_data(
+            repo_info, new_commits, branch, truncated=truncated
+        )
+        return await self.render_data(data)
+
+    async def render_data(self, data: Dict) -> Optional[str]:
+        """渲染任意模板上下文为图片（Commit / Issues 共用同一套模板）"""
         if not self.available():
             logger.error("文转图功能不可用：html_render 未注入")
             return None
 
+        template_name = ""
         try:
-            data = self.build_render_data(repo_info, new_commits, branch)
             template_name = self._resolve_template_name()
             html = self.template_manager.render(template_name, data)
         except Exception as e:
-            logger.error(f"渲染 commit 卡片模板失败: {e}")
+            logger.error(f"渲染卡片模板失败: {e}")
             return None
 
         logger.info(
-            f"开始 T2I 渲染 commit 卡片: {data['repo_name']}, "
-            f"模板 {template_name}, {data['commit_count']} 个提交"
+            f"开始 T2I 渲染卡片: {data.get('repo_name', '未知仓库')}, "
+            f"模板 {template_name}, {data.get('commit_count', 0)} 条动态"
         )
 
         for attempt, options in enumerate(self._render_strategies(), 1):
@@ -185,7 +216,7 @@ class ImageRenderService:
             image_bytes = await self._coerce_bytes(result)
             if image_bytes and is_valid_image(image_bytes):
                 logger.info(
-                    f"commit 卡片渲染成功: 模板 {template_name}, "
+                    f"卡片渲染成功: 模板 {template_name}, "
                     f"{len(image_bytes) / 1024:.1f} KB"
                 )
                 return base64.b64encode(image_bytes).decode()
