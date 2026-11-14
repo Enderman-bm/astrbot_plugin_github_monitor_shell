@@ -6,13 +6,21 @@
 
 ### Added
 
-- 新增「仓库分流设置」独立配置分组（`repo_routing`）：可在插件设置面板中通过模板列表逐条添加仓库分流规则（`owner` / `repo` / `branch` / `groups` / `notification_targets` / `exclusive`），无需再手改 `repositories` 字典
-- 分流规则支持按分支精确匹配（指定 `branch` 的规则优先于不限定分支的规则），并支持单条规则启用/停用
+- 设置面板新增「仓库分流设置」独立配置分组（`repo_routing`）：通过模板列表逐条添加仓库分流规则，无需再手改 `repositories` 字典
+- 每条规则支持 `owner` / `repo` / `branch` / `groups` / `notification_targets` / `exclusive`，并支持单条规则启用/停用
+- 分流规则支持按分支精确匹配：指定 `branch` 的规则优先于不限定分支的规则；同一仓库存在多条同优先级规则时，后添加的生效
+- 独立分流规则默认 `exclusive=true`，即只发给规则里的目标；需要与全局目标并集时将 `exclusive` 改为 `false`
 
 ### Changed
 
 - 匹配到独立分流规则的仓库优先使用规则中的目标与 `exclusive` 设置；未匹配到时继续使用 `repositories` 内的仓库级配置，完全向后兼容
 - `repositories` 中的 `groups` / `notification_targets` / `exclusive` 保留为兼容写法，并同步更新配置提示与 README
+- `repo_routing.enabled` 可一键停用独立分流规则，回退到 `repositories` 仓库级配置
+
+### Compatibility
+
+- 独立分流面板使用 AstrBot `template_list` 配置类型，需要 AstrBot v4.10.4+；旧版本继续使用 `repositories` 内的仓库级字段，代码逻辑完全兼容
+- 分流规则只负责推送目标，不会自动把仓库加入监控；监控仓库仍需配置在 `repositories` 中
 
 ## \[1.7.0] - 2026-11-14
 
