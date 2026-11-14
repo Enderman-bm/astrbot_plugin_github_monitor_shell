@@ -25,7 +25,8 @@
 
 除了原有的配置项，现在还支持：
 
-- `group_notification_targets`: 全局群通知目标，所有仓库（仓库配置 `exclusive: true` 时除外）都会通知这些群聊
+- `group_notification_targets`: 全局群通知目标，所有仓库（仓库配置 `exclusive: true` 或匹配到独立分流规则时除外）都会通知这些群聊
+- `repo_routing`: 独立的仓库分流设置。可在设置面板中逐条添加规则，为不同仓库指定不同群聊/私聊目标，无需再手改 `repositories` 字典
 - `time_zone`: 时间显示时区（默认 `Asia/Shanghai`，即可显示为北京时间）
 - `time_format`: 时间显示格式，使用 Python `strftime` 语法，默认 `%Y-%m-%d %H:%M:%S`
 - `forward_merge`: 合并转发推送，开启后本轮轮询检测到的 commit 通知会先收集、再整合成一条「合并转发」聊天记录发送
@@ -57,9 +58,35 @@ QQ 官方机器人（qq_official / qq_official_webhook）没有传统数字群�
 
 > 自动匹配行为：直接填写目标 ID（不写 UMO）时，插件会按 ID 特征自动选择平台——纯数字 ID 优先匹配 aiocqhttp（OneBot）；非数字 ID（官方bot的十六进制 openid）优先匹配 qq_official / qq_official_webhook。因此即使多平台同时运行，直接填 openid 也能正确路由到官方 bot，无需手动关闭其他适配器。
 
-## 仓库配置增强功能
+## 仓库分流设置（独立面板）
 
-现在支持为每个仓库单独配置通知群组，并可通过 `exclusive` 实现仓库级分流。
+插件设置面板中新增了「仓库分流设置」分组，用于独立管理不同仓库的推送目标。这样 `repositories` 只负责“监控哪些仓库”，分流设置负责“发到哪里”。
+
+- `repo_routing.enabled`: 是否启用独立分流规则（默认开启）。关闭后忽略规则，回退到 `repositories` 内的仓库级配置。
+- `repo_routing.rules`: 规则列表，通过模板列表逐条添加。每条规则包含：
+  - `enabled`: 是否启用此规则（默认开启）
+  - `owner` / `repo`: 必填，匹配 `repositories` 中已监控的仓库
+  - `branch`: 可选，留空匹配该仓库所有分支；填写后只匹配指定分支
+  - `groups`: 该仓库专属群聊目标
+  - `notification_targets`: 该仓库专属私聊目标
+  - `exclusive`: 默认 `true`，只发给本规则目标，不再叠加全局目标；设为 `false` 则与全局目标并集
+
+匹配优先级：指定 `branch` 的规则 > 不限定 `branch` 的规则；同一仓库存在多条同优先级规则时，后添加的生效。匹配到规则的仓库会**优先使用规则中的目标**，不再使用 `repositories` 里的 `groups` / `notification_targets` / `exclusive`。
+
+> 注意：分流规则只决定推送目标，**不会自动把仓库加入监控**。要监控的仓库仍然必须写在 `repositories` 里。
+>
+> 独立分流面板使用 AstrBot 的 `template_list` 配置类型，需要 AstrBot v4.10.4+。旧版本请继续在 `repositories` 字典里使用 `groups` / `notification_targets` / `exclusive`。
+
+示例：仓库 A 只发群 111111 和私聊 10001，仓库 B 只发群 222222：
+
+| 规则 | owner/repo | groups | notification_targets | exclusive |
+|---|---|---|---|---|
+| 1 | owner-a/repo-a | 111111 | 10001 | true |
+| 2 | owner-b/repo-b | 222222 | — | true |
+
+## 仓库配置增强功能（兼容写法）
+
+仍然支持在 `repositories` 字典里直接写 `groups` / `notification_targets` / `exclusive`，适合不想使用独立分流面板或需要手写配置的场景。匹配到独立分流规则的仓库，以独立规则为准。
 
 ### 字符串格式配置
 
@@ -72,7 +99,7 @@ QQ 官方机器人（qq_official / qq_official_webhook）没有传统数字群�
 
 字符串格式只支持群聊目标，且始终与全局目标并集（向后兼容）。
 
-### 字典格式配置（推荐）
+### 字典格式配置（兼容，推荐使用独立分流面板）
 
 ```json
 "repositories": [

@@ -9,7 +9,7 @@
     "type": "list",
     "description": "要监控的仓库列表，支持两种格式：1.字符串格式 2.字典格式 ",
     "default": [],
-    "hint": "例如:1592363624/astrbot_plugin_github_monitor_shell|123456|91219736 或 {\"owner\": \"1592363624\", \"repo\": \"astrbot_plugin_github_monitor_shell\", \"groups\": [\"123456\"], \"notification_targets\": [\"10001\"], \"exclusive\": true}。群号/私聊目标也支持 UMO 格式（平台ID:消息类型:会话ID）。exclusive 为 true 时该仓库不再叠加全局通知目标，实现仓库级分流"
+    "hint": "例如:1592363624/astrbot_plugin_github_monitor_shell|123456|91219736 或 {\"owner\": \"1592363624\", \"repo\": \"astrbot_plugin_github_monitor_shell\", \"groups\": [\"123456\"], \"notification_targets\": [\"10001\"], \"exclusive\": true}。群号/私聊目标也支持 UMO 格式（平台ID:消息类型:会话ID）。更推荐在下方「仓库分流设置」里独立配置推送目标；这里仍保留 groups / notification_targets / exclusive 作为兼容写法"
   },
   "check_interval": {
     "type": "int",
@@ -41,6 +41,77 @@
     "description": "全局群通知目标",
     "default": [],
     "hint": "所有仓库更新时都会通知这些群组（仓库配置 exclusive=true 时除外）。如果需要为特定仓库配置额外的群组，请在仓库配置中指定。支持两种格式：1.纯数字群号，如 123456；2.UMO 格式：平台ID:GroupMessage:会话ID，如 aiocqhttp:GroupMessage:123456 或 小爱同学:GroupMessage:0771687B325FC423AD9F4C06A88D84E3（推荐，适配QQ官方机器人的十六进制openid及多bot场景）"
+  },
+  "repo_routing": {
+    "type": "object",
+    "description": "仓库分流设置",
+    "hint": "独立管理不同仓库的推送目标。这里只决定“发到哪里”，监控哪些仓库仍由上方 repositories 决定。匹配到规则的仓库会使用规则中的 groups / notification_targets / exclusive，不再使用 repositories 里的同名字段。模板列表需要 AstrBot v4.10.4+；旧版本请继续使用 repositories 内的仓库级字段。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用仓库分流规则",
+        "default": true,
+        "hint": "关闭后忽略下方规则，回退到 repositories 中的仓库级配置"
+      },
+      "rules": {
+        "type": "template_list",
+        "description": "仓库分流规则",
+        "default": [],
+        "hint": "每条规则对应一个仓库。exclusive=true 时只发给本规则目标，不再叠加全局目标。匹配优先级：指定 branch 的规则 > 不限定 branch 的规则；同一仓库多条规则时后添加的生效。",
+        "templates": {
+          "repo_rule": {
+            "name": "仓库分流规则",
+            "hint": "配置一个仓库的推送目标",
+            "display_item": "repo",
+            "items": {
+              "enabled": {
+                "type": "bool",
+                "description": "启用此规则",
+                "default": true
+              },
+              "owner": {
+                "type": "string",
+                "description": "仓库所有者",
+                "default": "",
+                "hint": "例如 1592363624"
+              },
+              "repo": {
+                "type": "string",
+                "description": "仓库名",
+                "default": "",
+                "hint": "例如 astrbot_plugin_github_monitor_shell"
+              },
+              "branch": {
+                "type": "string",
+                "description": "分支（可选）",
+                "default": "",
+                "hint": "留空表示匹配该仓库所有分支；填写后只匹配指定分支"
+              },
+              "groups": {
+                "type": "list",
+                "description": "群聊目标",
+                "default": [],
+                "items": {"type": "string"},
+                "hint": "纯数字群号或 UMO 格式，如 aiocqhttp:GroupMessage:123456"
+              },
+              "notification_targets": {
+                "type": "list",
+                "description": "私聊目标",
+                "default": [],
+                "items": {"type": "string"},
+                "hint": "纯数字QQ号或 UMO 格式，如 qq_official:FriendMessage:xxxx"
+              },
+              "exclusive": {
+                "type": "bool",
+                "description": "仅使用本规则目标",
+                "default": true,
+                "hint": "开启后不再叠加全局私聊/群聊目标；关闭则与全局目标并集"
+              }
+            }
+          }
+        }
+      }
+    }
   },
   "platform_id": {
     "type": "string",

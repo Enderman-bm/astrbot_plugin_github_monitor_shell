@@ -2,6 +2,18 @@
 
 所有 noteworthy 的插件更新都会记录在此文件中。
 
+## \[1.7.1] - 2026-11-14
+
+### Added
+
+- 新增「仓库分流设置」独立配置分组（`repo_routing`）：可在插件设置面板中通过模板列表逐条添加仓库分流规则（`owner` / `repo` / `branch` / `groups` / `notification_targets` / `exclusive`），无需再手改 `repositories` 字典
+- 分流规则支持按分支精确匹配（指定 `branch` 的规则优先于不限定分支的规则），并支持单条规则启用/停用
+
+### Changed
+
+- 匹配到独立分流规则的仓库优先使用规则中的目标与 `exclusive` 设置；未匹配到时继续使用 `repositories` 内的仓库级配置，完全向后兼容
+- `repositories` 中的 `groups` / `notification_targets` / `exclusive` 保留为兼容写法，并同步更新配置提示与 README
+
 ## \[1.7.0] - 2026-11-14
 
 ### Added

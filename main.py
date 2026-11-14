@@ -129,6 +129,15 @@ class GitHubMonitorPlugin(Star):
         except Exception as e:
             logger.error(f"保存项目仓库 Issues 状态失败: {str(e)}")
 
+    @staticmethod
+    def _as_bool(value, default: bool = False) -> bool:
+        """兼容 bool / 字符串形式（配置面板或手写 JSON 都可能出现）"""
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
     def _parse_repository_config(self, repo_config) -> Dict | None:
         """把仓库配置统一解析为内部结构
 
@@ -155,11 +164,7 @@ class GitHubMonitorPlugin(Star):
             repo = str(repo_config.get("repo") or "").strip()
             branch = repo_config.get("branch")
             branch = str(branch).strip() if branch else None
-            exclusive_raw = repo_config.get("exclusive", False)
-            if isinstance(exclusive_raw, str):
-                exclusive = exclusive_raw.strip().lower() in ("1", "true", "yes", "on")
-            else:
-                exclusive = bool(exclusive_raw)
+            exclusive = self._as_bool(repo_config.get("exclusive", False), False)
             return {
                 "owner": owner,
                 "repo": repo,
@@ -195,6 +200,66 @@ class GitHubMonitorPlugin(Star):
             global_groups + dedupe_targets(repo_cfg.get("groups", []))
         )
         return private_targets, group_targets
+
+    def _load_repo_routing_rules(self) -> Dict[tuple, Dict]:
+        """加载设置面板里的独立仓库分流规则
+
+        返回 {(owner_lower, repo_lower, branch): 规则}；branch 为空字符串表示
+        匹配该仓库的所有分支。规则只覆盖推送目标，不会新增监控仓库。
+        """
+        routing_cfg = self.config.get("repo_routing", {}) or {}
+        if not isinstance(routing_cfg, dict):
+            logger.warning("repo_routing 配置格式不是对象，已忽略")
+            return {}
+        if not self._as_bool(routing_cfg.get("enabled", True), True):
+            return {}
+
+        rules = routing_cfg.get("rules", []) or []
+        if not isinstance(rules, list):
+            logger.warning("repo_routing.rules 配置格式不是列表，已忽略")
+            return {}
+
+        rules_map: Dict[tuple, Dict] = {}
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            if not self._as_bool(rule.get("enabled", True), True):
+                continue
+
+            owner = str(rule.get("owner") or "").strip()
+            repo = str(rule.get("repo") or "").strip()
+            branch = str(rule.get("branch") or "").strip()
+            if not owner or not repo:
+                logger.warning(f"仓库分流规则缺少 owner/repo，已跳过: {rule}")
+                continue
+
+            rules_map[(owner.lower(), repo.lower(), branch)] = {
+                "owner": owner,
+                "repo": repo,
+                "branch": branch or None,
+                "groups": dedupe_targets(rule.get("groups", [])),
+                "notification_targets": dedupe_targets(
+                    rule.get("notification_targets",
+                             rule.get("private_targets", []))
+                ),
+                # 独立分流规则默认隔离全局目标，显式 false 才并集
+                "exclusive": self._as_bool(rule.get("exclusive", True), True),
+            }
+        return rules_map
+
+    @staticmethod
+    def _find_repo_routing_rule(rules_map: Dict[tuple, Dict], owner: str,
+                                repo: str, branch: str) -> Dict | None:
+        """按“指定分支优先、任意分支兜底”查找仓库分流规则"""
+        if not rules_map:
+            return None
+        owner_key = str(owner).strip().lower()
+        repo_key = str(repo).strip().lower()
+        branch_key = str(branch or "").strip()
+        rule = rules_map.get((owner_key, repo_key, branch_key))
+        if rule is None:
+            rule = rules_map.get((owner_key, repo_key, ""))
+        return rule
 
     def _is_commit_already_notified(self, repo_key: str, commit_sha: str, targets: List[str]) -> bool:
         """检查commit是否已经发送过通知给这些目标
@@ -260,6 +325,7 @@ class GitHubMonitorPlugin(Star):
 
         commit_data = self._load_commit_data()
         updated_count = 0
+        routing_rules = self._load_repo_routing_rules()
 
         # 创建当前配置中的仓库键集合，用于清理已删除的仓库数据
         configured_repo_keys = set()
@@ -288,9 +354,18 @@ class GitHubMonitorPlugin(Star):
             repo_key = f"{owner}/{repo}/{actual_branch}"
             configured_repo_keys.add(repo_key)
 
-            # 按仓库解析最终生效的推送目标（exclusive=True 时不再叠加全局目标）
-            private_targets, group_targets = self._resolve_repo_targets(repo_cfg)
+            # 独立分流规则优先；未匹配到时回退到 repositories 里的仓库级配置
+            route_rule = self._find_repo_routing_rule(
+                routing_rules, owner, repo, actual_branch
+            )
+            target_cfg = route_rule or repo_cfg
+            private_targets, group_targets = self._resolve_repo_targets(target_cfg)
             all_targets = combine_target_keys(private_targets, group_targets)
+            if route_rule:
+                logger.debug(
+                    f"仓库 {repo_key} 使用独立分流规则"
+                    f"（私聊 {len(private_targets)} 个，群 {len(group_targets)} 个）"
+                )
 
             # Issues 增量监控：与 Commit 同轮检测，推送目标遵循仓库分流
             if self.config.get("issue_monitor_enabled", True):
