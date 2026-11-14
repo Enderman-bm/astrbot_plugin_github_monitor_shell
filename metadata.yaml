@@ -3,4 +3,4 @@ display_name: GitHub监控插件
 author: Shell
 version: 1.7.1
 desc: 定时监控GitHub仓库commit变化并发送通知,还能查询仓库所有open的Issue方便管理问题
-repo: https://github.com/1592363624/astrbot_plugin_github_monitor_shell
+repo: https://github.com/Enderman-bm/astrbot_plugin_github_monitor_shell
