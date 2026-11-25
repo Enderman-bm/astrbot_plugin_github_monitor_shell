@@ -12,7 +12,7 @@
 
 # 效果图
 
-<img width="947" height="809" alt="Shell截图_20251104142553" src="https://github.com/user-attachments/assets/b10366c3-c6e6-4f0f-a77c-d6c122ac6611" />
+<img width="947" height="809" alt="Shell截图_20251104142553" src="https://github.com/user-attachments/assets/b10366c3-c6ce-4f0f-a7c-6dc122ac6611" />
 
 
 # 手动触发指令
@@ -32,6 +32,7 @@
 - `forward_merge`: 合并转发推送，开启后本轮轮询检测到的 commit 通知会先收集、再整合成一条「合并转发」聊天记录发送
 - `commit_stats`: 提交变更统计（默认开启），在通知中显示本次提交的改动文件数与增删行数，多个提交时额外汇总一行「本轮总计」；`max_commits` 控制单次通知最多统计几个提交（默认 10，填 0 关闭统计）
 - `commit_fetch`: Commit 收集设置。`max_commits` 控制单次检查最多收集多少个提交（默认 50，范围 1-500）。插件会分页拉取，直到遇到上次记录的提交或达到上限；达到上限时通知中会提示「更早提交未展示」。原来的实现固定只取 10 条且不翻页，两次检查之间提交较多时会静默丢提交
+- `monitor_schedule`: 检测时段控制。`mode` 为 `blacklist`（默认，配置的时段不检测，如夜间静音）或 `whitelist`（仅在配置的时段检测）；`ranges` 填时段列表，格式 `HH:MM-HH:MM`，支持跨天（如 `22:00-07:00`）与多个时段；`weekdays` 可按星期限制生效日（0=周一，留空每天生效）。暂停期间恢复检测后会一次性补发暂停窗口内的提交，不会丢失；手动 `/github_monitor` 不受时段限制
 - `commit_display`: Commit 信息展示。`message_mode` 支持 `full`（默认，完整展示并保留正文换行）和 `first_line`（只展示第一行/提交标题），文本通知、图片卡片、合并转发节点同步生效
 - `issue_output_format`: Issues 增量通知输出格式，`text`（默认，结构化文本卡）或 `image`（图片卡片，复用 Commit 卡片模板主题）
 
@@ -122,6 +123,7 @@ QQ 官方机器人（qq_official / qq_official_webhook）没有传统数字群�
 - `notification_targets`: 该仓库专属私聊目标（也兼容别名 `private_targets`）。
 - `exclusive`: 默认 `false`，保持旧行为「全局目标 + 仓库目标」并集；设为 `true` 时该仓库**只发给自己的目标**，不再叠加全局私聊/群聊目标。
 - `branch`: 可选，指定监控分支；不填则使用仓库默认分支。
+- `branches`: 可选，分支列表，一次监控多个分支，如 `["main", "dev"]`；填 `["all"]` 或 `["*"]` 表示监控**全部分支**（每轮自动枚举，新建分支自动纳入监控）。与 `branch` 同时配置时以 `branches` 为准。每个分支独立检测、独立去重，分流规则可按分支精确匹配（如给 `dev` 分支单独指定推送目标）。
 
 示例：仓库 A 只发群 111111 和私聊 10001，仓库 B 只发群 222222，互不串群：
 
