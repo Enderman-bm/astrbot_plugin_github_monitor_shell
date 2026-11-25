@@ -12,7 +12,7 @@
 
 # 效果图
 
-<img width="947" height="809" alt="Shell截图_20251104142553" src="https://github.com/user-attachments/assets/b10366c3-c6ce-4f0f-a7c-6dc122ac6611" />
+<img width="947" height="809" alt="Shell截图_20251104142553" src="https://github.com/user-attachments/assets/b10366c3-c6e6-4f0f-a77c-d6dc122ac6611" />
 
 
 # 手动触发指令

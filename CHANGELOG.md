@@ -49,7 +49,7 @@
 
 - Commit 收集改为分页拉取，新增 `commit_fetch.max_commits`（默认 50，范围 1-500）：修复旧实现固定 `per_page=10` 且只取第一页、两次检查之间超过 10 个提交时旧提交被静默丢弃的问题；达到上限时通知中提示「更早提交未展示」
 - 新增仓库级推送分流：仓库字典配置支持 `notification_targets`（仓库专属私聊，兼容别名 `private_targets`）和 `exclusive`（为 `true` 时不再叠加全局目标）；Commit、Issues 增量通知、合并转发、失败重试统一按仓库路由
-- 新增 `commit_display.message_mode`：`full`（默认，完整展示并保留正文换行）/ `first_line`（只展示第一行/提交标题）；文本、图片卡片、合并转发节点同步生效
+- 新增 `commit_display.message_mode`：`full`（默认，完整展示并保留正文换行）/ `first_line`（只展示第一行/提交标题）；文本通知、图片卡片、合并转发节点同步生效
 - 新增 Issues 增量通知：与 Commit 同轮检查，检测新增 Issue、新评论、标题/标签/评论数变化、Issue 关闭，并按「每仓库每轮一张卡」推送；文本卡附带标签、评论数、状态等进度信息，图片卡复用 Commit 卡片模板（`issue_output_format: text/image`）
 - 图片卡片模板上下文新增 `count_text`、`summary_text`、`message_full`、`message_first_line`、`commits[].details`、`truncated`，自定义模板可用来区分 Commit / Issues 卡片
 
@@ -178,3 +178,4 @@
 ### Added
 
 - 初始版本发布
+
