@@ -309,6 +309,61 @@ class GitHubService:
             logger.error(f"获取仓库信息失败: {str(e)}")
             return None
 
+    async def list_branches(self, owner: str, repo: str,
+                            max_branches: int = 100) -> Optional[List[str]]:
+        """分页获取仓库的分支名列表（用于分支控制的「全部分支」模式）"""
+        try:
+            url = f"{self.base_url}/repos/{owner}/{repo}/branches"
+            max_branches = max(1, int(max_branches or 100))
+            per_page = min(100, max_branches)
+            names: List[str] = []
+            page = 1
+
+            while True:
+                params = {"per_page": per_page, "page": page}
+                logger.info(f"正在获取分支列表: {url}（第 {page} 页）")
+
+                async with httpx.AsyncClient(
+                        timeout=30.0,
+                        verify=False
+                ) as client:
+                    response = await client.get(url, headers=self.headers, params=params)
+
+                if response.status_code == 404:
+                    logger.warning(f"仓库不存在: {owner}/{repo}")
+                    return None
+                elif response.status_code == 403:
+                    logger.error(f"访问被拒绝或API限制: {response.status_code} - {response.text}")
+                    return None
+                elif response.status_code != 200:
+                    logger.error(f"获取分支列表失败: {response.status_code} - {response.text}")
+                    return None
+
+                page_data = response.json()
+                if not isinstance(page_data, list) or not page_data:
+                    break
+
+                names.extend(
+                    item["name"] for item in page_data
+                    if isinstance(item, dict) and item.get("name")
+                )
+                if len(names) >= max_branches:
+                    names = names[:max_branches]
+                    logger.warning(
+                        f"仓库 {owner}/{repo} 分支数超过单次上限 {max_branches}，"
+                        "仅监控前一部分分支"
+                    )
+                    break
+                if not self._has_next_page(response):
+                    break
+                page += 1
+
+            return names
+
+        except Exception as e:
+            logger.error(f"请求GitHub API失败: {str(e)}")
+            return None
+
     async def get_open_issues(self, owner: str, repo: str,
                               max_issues: int = 500) -> Optional[List[Dict]]:
         """分页获取指定仓库的所有 open issues（最多 max_issues 条）

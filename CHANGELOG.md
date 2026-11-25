@@ -2,6 +2,27 @@
 
 所有 noteworthy 的插件更新都会记录在此文件中。
 
+## \[1.8.0] - 2026-11-25
+
+### Added
+
+- 新增检测时段控制（`monitor_schedule` 配置分组）：支持在某时段暂停检测（`blacklist` 模式，如夜间静音）或仅在某时段检测（`whitelist` 模式）
+- 时段格式为 `HH:MM-HH:MM`，支持跨天（如 `22:00-07:00`）与多个时段，并可按星期限制生效日（`weekdays`，0=周一，留空表示每天）
+- 暂停期间自动轮询与失败通知重试都会跳过；恢复检测后，暂停窗口内产生的提交会基于上次记录的 SHA 一次性补发，不会丢失
+- 手动 `/github_monitor` 指令不受时段限制，`/github_status` 会显示当前时段控制状态
+- 新增分支控制：仓库字典配置支持 `branches` 字段（分支列表），可一次监控多个分支；填 `["all"]` 或 `["*"]` 表示监控全部分支（每轮通过 GitHub API 枚举，自动覆盖新建分支）
+- 新增 GitHub API 封装 `list_branches()`：分页获取仓库分支名列表，供全分支监控使用
+
+### Changed
+
+- 每个被监控分支独立使用 `owner/repo/branch` 作为数据与去重键，互不串扰；仓库分流规则按分支精确匹配的语义不变
+- Issues 增量监控与分支无关，仍保持每仓库每轮只检查一次，推送目标沿用默认分支对应的分流规则
+- `branch`（单分支）与 `branches` 同时配置时以 `branches` 为准；两者都未配置时维持原行为（监控默认分支）
+
+### Compatibility
+
+- 时段控制与分支控制均为新增配置项，默认关闭/不填，旧配置完全兼容
+
 ## \[1.7.1] - 2026-11-14
 
 ### Added
@@ -28,7 +49,7 @@
 
 - Commit 收集改为分页拉取，新增 `commit_fetch.max_commits`（默认 50，范围 1-500）：修复旧实现固定 `per_page=10` 且只取第一页、两次检查之间超过 10 个提交时旧提交被静默丢弃的问题；达到上限时通知中提示「更早提交未展示」
 - 新增仓库级推送分流：仓库字典配置支持 `notification_targets`（仓库专属私聊，兼容别名 `private_targets`）和 `exclusive`（为 `true` 时不再叠加全局目标）；Commit、Issues 增量通知、合并转发、失败重试统一按仓库路由
-- 新增 `commit_display.message_mode`：`full`（默认，完整展示并保留正文换行）/ `first_line`（只展示第一行/提交标题）；文本通知、图片卡片、合并转发节点同步生效
+- 新增 `commit_display.message_mode`：`full`（默认，完整展示并保留正文换行）/ `first_line`（只展示第一行/提交标题）；文本、图片卡片、合并转发节点同步生效
 - 新增 Issues 增量通知：与 Commit 同轮检查，检测新增 Issue、新评论、标题/标签/评论数变化、Issue 关闭，并按「每仓库每轮一张卡」推送；文本卡附带标签、评论数、状态等进度信息，图片卡复用 Commit 卡片模板（`issue_output_format: text/image`）
 - 图片卡片模板上下文新增 `count_text`、`summary_text`、`message_full`、`message_first_line`、`commits[].details`、`truncated`，自定义模板可用来区分 Commit / Issues 卡片
 
@@ -157,4 +178,3 @@
 ### Added
 
 - 初始版本发布
-
