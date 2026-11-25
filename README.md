@@ -6,13 +6,13 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-3.4%2B-orange.svg)](https://github.com/Soulter/AstrBot)
-[![GitHub](https://img.shields.io/badge/作者-Shell-blue)](https://github.com/1592363624)
+[![GitHub](https://img.shields.io/badge/%E4%BD%9C%E8%80%85-Shell-blue)](https://github.com/1592363624)
 
 </div>
 
 # 效果图
 
-<img width="947" height="809" alt="Shell截图_20251104142553" src="https://github.com/user-attachments/assets/b10366c3-c6e6-4f0f-a77c-d6dc122ac6611" />
+<img width="947" height="809" alt="Shell截图_20251104142553" src="https://github.com/user-attachments/assets/b10366c3-c6e6-4f0f-a77c-d6c122ac6611" />
 
 
 # 手动触发指令
