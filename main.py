@@ -16,6 +16,7 @@ from .services.onebot_direct import OneBotDirectSender
 from .services.template_manager import TemplateManager
 from .utils.target_utils import combine_target_keys, dedupe_targets
 from .utils.text_utils import split_long_message
+from .utils.time_utils import should_monitor_now
 
 
 class GitHubMonitorPlugin(Star):
@@ -38,6 +39,9 @@ class GitHubMonitorPlugin(Star):
             self.commit_fetch_max_commits = max(1, int(commit_fetch_cfg.get("max_commits", 50)))
         except (TypeError, ValueError):
             self.commit_fetch_max_commits = 50
+        # 检测时段控制：在某时段暂停检测 / 仅在某时段检测（见 _conf_schema.json 的 monitor_schedule）
+        schedule_cfg = self.config.get("monitor_schedule", {}) or {}
+        self.monitor_schedule = schedule_cfg if isinstance(schedule_cfg, dict) else {}
         plugin_data_dir = StarTools.get_data_dir("GitHub监控插件")
         # 文转图相关服务（模板目录：插件内置 templates/ + 数据目录自定义 templates/）
         template_manager = TemplateManager(
@@ -142,7 +146,7 @@ class GitHubMonitorPlugin(Star):
         """把仓库配置统一解析为内部结构
 
         字符串格式: "owner/repo|群1|群2"
-        字典格式: {"owner", "repo", "branch", "groups", "notification_targets", "exclusive"}
+        字典格式: {"owner", "repo", "branch", "branches", "groups", "notification_targets", "exclusive"}
         """
         if isinstance(repo_config, str):
             parts = [part.strip() for part in repo_config.split("|")]
@@ -154,6 +158,7 @@ class GitHubMonitorPlugin(Star):
                 "owner": owner.strip(),
                 "repo": repo.strip(),
                 "branch": None,
+                "branches": None,
                 "groups": dedupe_targets(parts[1:]),
                 "notification_targets": [],
                 "exclusive": False,
@@ -164,11 +169,21 @@ class GitHubMonitorPlugin(Star):
             repo = str(repo_config.get("repo") or "").strip()
             branch = repo_config.get("branch")
             branch = str(branch).strip() if branch else None
+            # branches 支持多分支列表；包含 all / *（不区分大小写）表示全部分支。
+            # 与 branch 同时配置时以 branches 为准。
+            branches = repo_config.get("branches")
+            if isinstance(branches, (str, list)):
+                if isinstance(branches, str):
+                    branches = [branches]
+                branches = [str(b).strip() for b in branches if str(b).strip()] or None
+            else:
+                branches = None
             exclusive = self._as_bool(repo_config.get("exclusive", False), False)
             return {
                 "owner": owner,
                 "repo": repo,
                 "branch": branch or None,
+                "branches": branches,
                 "groups": dedupe_targets(repo_config.get("groups", [])),
                 # notification_targets 为推荐字段；private_targets 作为兼容别名
                 "notification_targets": dedupe_targets(
@@ -305,17 +320,66 @@ class GitHubMonitorPlugin(Star):
         self.monitoring_started = False
         self._monitor_task = None
 
+    def _is_monitoring_active(self) -> bool:
+        """按 monitor_schedule 配置判断当前时段是否进行检测（时段控制）
+
+        blacklist 模式落在配置时段内、whitelist 模式落在配置时段外时暂停；
+        暂停期间自动轮询与失败通知重试都会跳过，手动 /github_monitor 不受限制。
+        """
+        if not self._as_bool(self.monitor_schedule.get("enabled"), False):
+            return True
+        active = should_monitor_now(
+            self.monitor_schedule, self.config.get("time_zone", "Asia/Shanghai")
+        )
+        if not active:
+            mode = str(self.monitor_schedule.get("mode") or "blacklist").lower()
+            ranges = self.monitor_schedule.get("ranges") or []
+            weekdays = self.monitor_schedule.get("weekdays") or []
+            logger.info(
+                f"时段控制生效（模式 {mode}，时段 {ranges}，星期 {weekdays}），"
+                "本轮暂停检测与失败重试"
+            )
+        return active
+
     async def _monitor_loop(self):
         """监控循环"""
         while True:
             try:
-                await self._check_repositories()
-                # 定期重试失败的通知
-                await self.notification_service.retry_failed_notifications()
+                if self._is_monitoring_active():
+                    await self._check_repositories()
+                    # 定期重试失败的通知
+                    await self.notification_service.retry_failed_notifications()
                 await asyncio.sleep(self.config.get("check_interval", 60) * 60)
             except Exception as e:
                 logger.error(f"监控循环出错: {str(e)}")
                 await asyncio.sleep(60)  # 出错时等待1分钟再重试
+
+    async def _resolve_monitor_branches(self, owner: str, repo: str,
+                                        repo_cfg: Dict, default_branch: str) -> List[str]:
+        """解析单个仓库本轮需要检测的分支列表（分支控制）
+
+        - 配置了 ``branches`` 列表时：包含 ``all`` / ``*``（不区分大小写）表示
+          监控全部分支（每轮通过 GitHub API 枚举，自动覆盖新建分支）；
+          否则按列表逐个监控
+        - 只配置单个 ``branch`` 时：只监控该分支
+        - 两者都未配置：监控默认分支
+        """
+        branches_cfg = repo_cfg.get("branches")
+        if branches_cfg:
+            if any(str(b).strip().lower() in ("all", "*") for b in branches_cfg):
+                all_branches = await self.github_service.list_branches(owner, repo)
+                if all_branches:
+                    logger.info(
+                        f"仓库 {owner}/{repo} 全分支监控：本轮检测 {len(all_branches)} 个分支"
+                    )
+                    return all_branches
+                logger.warning(
+                    f"仓库 {owner}/{repo} 枚举分支失败，回退到默认分支 {default_branch}"
+                )
+                return [default_branch]
+            return list(branches_cfg)
+        branch = repo_cfg.get("branch")
+        return [branch] if branch else [default_branch]
 
     async def _check_repositories(self):
         """检查所有仓库的更新"""
@@ -338,7 +402,6 @@ class GitHubMonitorPlugin(Star):
 
             owner = repo_cfg["owner"]
             repo = repo_cfg["repo"]
-            branch = repo_cfg["branch"]
             if not owner or not repo:
                 logger.warning(f"仓库配置缺少owner或repo: {repo_config}")
                 continue
@@ -350,111 +413,123 @@ class GitHubMonitorPlugin(Star):
                 continue
 
             default_branch = repo_info.get("default_branch", "main") or "main"
-            actual_branch = branch or default_branch
-            repo_key = f"{owner}/{repo}/{actual_branch}"
-            configured_repo_keys.add(repo_key)
 
-            # 独立分流规则优先；未匹配到时回退到 repositories 里的仓库级配置
-            route_rule = self._find_repo_routing_rule(
-                routing_rules, owner, repo, actual_branch
+            # 解析本轮需要检测的分支（支持多分支 / 全部分支）
+            branches_to_monitor = await self._resolve_monitor_branches(
+                owner, repo, repo_cfg, default_branch
             )
-            target_cfg = route_rule or repo_cfg
-            private_targets, group_targets = self._resolve_repo_targets(target_cfg)
-            all_targets = combine_target_keys(private_targets, group_targets)
-            if route_rule:
-                logger.debug(
-                    f"仓库 {repo_key} 使用独立分流规则"
-                    f"（私聊 {len(private_targets)} 个，群 {len(group_targets)} 个）"
-                )
 
-            # Issues 增量监控：与 Commit 同轮检测，推送目标遵循仓库分流
+            # Issues 增量监控与分支无关：每仓库每轮只检查一次，
+            # 推送目标沿用默认分支对应的分流规则
             if self.config.get("issue_monitor_enabled", True):
+                issue_route = self._find_repo_routing_rule(
+                    routing_rules, owner, repo, default_branch
+                )
+                issue_target_cfg = issue_route or repo_cfg
+                issue_private, issue_groups = self._resolve_repo_targets(issue_target_cfg)
                 try:
                     await self._check_repo_issues(
-                        owner, repo, private_targets, group_targets,
-                        repo_info=repo_info, branch=actual_branch,
+                        owner, repo, issue_private, issue_groups,
+                        repo_info=repo_info, branch=default_branch,
                     )
                 except Exception as e:
                     logger.error(f"检查仓库 {owner}/{repo} 的 Issues 失败: {str(e)}")
 
-            # 获取最新commit
-            new_commit = await self.github_service.get_latest_commit(owner, repo, branch)
-            if not new_commit:
-                continue
+            for actual_branch in branches_to_monitor:
+                repo_key = f"{owner}/{repo}/{actual_branch}"
+                configured_repo_keys.add(repo_key)
 
-            old_commit = commit_data.get(repo_key)
-
-            # 检查是否有变化
-            if not old_commit or old_commit.get("sha") != new_commit["sha"]:
-                updated_count += 1
-                logger.info(f"检测到仓库 {repo_key} 有新的commit: {new_commit['sha'][:7]}")
-
-                # 获取所有新的提交
-                new_commits = [new_commit]  # 默认至少包含最新提交
-                truncated = False
-                if old_commit and old_commit.get("sha"):
-                    # 分页获取从上次记录的提交之后的所有提交
-                    commits_since = await self.github_service.get_commits_since(
-                        owner, repo, old_commit.get("sha"), branch,
-                        max_commits=self.commit_fetch_max_commits,
+                # 独立分流规则优先；未匹配到时回退到 repositories 里的仓库级配置
+                route_rule = self._find_repo_routing_rule(
+                    routing_rules, owner, repo, actual_branch
+                )
+                target_cfg = route_rule or repo_cfg
+                private_targets, group_targets = self._resolve_repo_targets(target_cfg)
+                all_targets = combine_target_keys(private_targets, group_targets)
+                if route_rule:
+                    logger.debug(
+                        f"仓库 {repo_key} 使用独立分流规则"
+                        f"（私聊 {len(private_targets)} 个，群 {len(group_targets)} 个）"
                     )
-                    if commits_since is None:
-                        # API调用失败，跳过此仓库，但保留旧数据不变
-                        continue
-                    if commits_since:
-                        new_commits = commits_since
-                        truncated = bool(getattr(commits_since, "truncated", False))
 
-                # 发送通知 (只有在确实有新提交时才发送)
-                if repo_info and new_commits:
-                    # 检查是否已经发送过通知
-                    latest_sha = new_commits[0]["sha"]
-                    if self._is_commit_already_notified(repo_key, latest_sha, all_targets):
-                        logger.info(f"仓库 {repo_key} 的提交 {latest_sha[:7]} 已经发送过通知，跳过")
-                    else:
-                        # 补全变更统计（文件数 / 增删行数），仅在真正要推送时调用，避免浪费 API 配额
-                        if self.commit_stats_enabled and self.commit_stats_max_commits > 0:
-                            await self.github_service.enrich_commit_stats(
-                                owner, repo, new_commits, self.commit_stats_max_commits
-                            )
+                # 获取最新commit
+                new_commit = await self.github_service.get_latest_commit(owner, repo, actual_branch)
+                if not new_commit:
+                    continue
 
-                        # 合并转发模式：本轮只收集，待所有仓库检查完成后统一整合发送
-                        if self.notification_service.forward_merge_enabled:
-                            self.notification_service.queue_commit_notification(
-                                repo_info, new_commits, private_targets, group_targets,
-                                branch=actual_branch, repo_key=repo_key,
-                                truncated=truncated,
-                            )
-                            logger.info(
-                                f"仓库 {repo_key} 的提交 {latest_sha[:7]} 已加入合并转发队列"
-                            )
+                old_commit = commit_data.get(repo_key)
+
+                # 检查是否有变化
+                if not old_commit or old_commit.get("sha") != new_commit["sha"]:
+                    updated_count += 1
+                    logger.info(f"检测到仓库 {repo_key} 有新的commit: {new_commit['sha'][:7]}")
+
+                    # 获取所有新的提交
+                    new_commits = [new_commit]  # 默认至少包含最新提交
+                    truncated = False
+                    if old_commit and old_commit.get("sha"):
+                        # 分页获取从上次记录的提交之后的所有提交
+                        commits_since = await self.github_service.get_commits_since(
+                            owner, repo, old_commit.get("sha"), actual_branch,
+                            max_commits=self.commit_fetch_max_commits,
+                        )
+                        if commits_since is None:
+                            # API调用失败，跳过此分支，但保留旧数据不变
+                            continue
+                        if commits_since:
+                            new_commits = commits_since
+                            truncated = bool(getattr(commits_since, "truncated", False))
+
+                    # 发送通知 (只有在确实有新提交时才发送)
+                    if repo_info and new_commits:
+                        # 检查是否已经发送过通知
+                        latest_sha = new_commits[0]["sha"]
+                        if self._is_commit_already_notified(repo_key, latest_sha, all_targets):
+                            logger.info(f"仓库 {repo_key} 的提交 {latest_sha[:7]} 已经发送过通知，跳过")
                         else:
-                            # 发送通知
-                            failed_private, failed_groups = await self.notification_service.send_commit_notification(
-                                repo_info, new_commits, private_targets, group_targets,
-                                branch=actual_branch, truncated=truncated,
-                            )
-                            # 只标记发送成功的目标；失败目标已进入待重试队列
-                            failed_private_set = set(failed_private)
-                            failed_group_set = set(failed_groups)
-                            successful_targets = combine_target_keys(
-                                [t for t in private_targets if t not in failed_private_set],
-                                [g for g in group_targets if g not in failed_group_set],
-                            )
-                            if successful_targets:
-                                self._mark_commit_as_notified(
-                                    repo_key, latest_sha, successful_targets
+                            # 补全变更统计（文件数 / 增删行数），仅在真正要推送时调用，避免浪费 API 配额
+                            if self.commit_stats_enabled and self.commit_stats_max_commits > 0:
+                                await self.github_service.enrich_commit_stats(
+                                    owner, repo, new_commits, self.commit_stats_max_commits
+                                )
+
+                            # 合并转发模式：本轮只收集，待所有仓库检查完成后统一整合发送
+                            if self.notification_service.forward_merge_enabled:
+                                self.notification_service.queue_commit_notification(
+                                    repo_info, new_commits, private_targets, group_targets,
+                                    branch=actual_branch, repo_key=repo_key,
+                                    truncated=truncated,
                                 )
                                 logger.info(
-                                    f"已标记仓库 {repo_key} 的提交 {latest_sha[:7]} "
-                                    f"为已通知（成功目标 {len(successful_targets)} 个）"
+                                    f"仓库 {repo_key} 的提交 {latest_sha[:7]} 已加入合并转发队列"
                                 )
+                            else:
+                                # 发送通知
+                                failed_private, failed_groups = await self.notification_service.send_commit_notification(
+                                    repo_info, new_commits, private_targets, group_targets,
+                                    branch=actual_branch, truncated=truncated,
+                                )
+                                # 只标记发送成功的目标；失败目标已进入待重试队列
+                                failed_private_set = set(failed_private)
+                                failed_group_set = set(failed_groups)
+                                successful_targets = combine_target_keys(
+                                    [t for t in private_targets if t not in failed_private_set],
+                                    [g for g in group_targets if g not in failed_group_set],
+                                )
+                                if successful_targets:
+                                    self._mark_commit_as_notified(
+                                        repo_key, latest_sha, successful_targets
+                                    )
+                                    logger.info(
+                                        f"已标记仓库 {repo_key} 的提交 {latest_sha[:7]} "
+                                        f"为已通知（成功目标 {len(successful_targets)} 个）"
+                                    )
 
-                # 更新数据
-                commit_data[repo_key] = new_commit  # 仍然只保存最新的提交SHA用于比较
-                self._save_commit_data(commit_data)
-            else:
-                logger.info(f"仓库 {repo_key} 无新commit（最新 {new_commit['sha'][:7]}）")
+                    # 更新数据
+                    commit_data[repo_key] = new_commit  # 仍然只保存最新的提交SHA用于比较
+                    self._save_commit_data(commit_data)
+                else:
+                    logger.info(f"仓库 {repo_key} 无新commit（最新 {new_commit['sha'][:7]}）")
 
         # 清理已删除仓库的数据
         removed_keys = set(commit_data.keys()) - configured_repo_keys
@@ -470,7 +545,7 @@ class GitHubMonitorPlugin(Star):
             await self._flush_forward_merge_notifications()
 
         logger.info(
-            f"本轮检查完成：共 {len(configured_repo_keys)} 个仓库，{updated_count} 个有更新"
+            f"本轮检查完成：共 {len(configured_repo_keys)} 个仓库分支，{updated_count} 个有更新"
         )
 
     async def _flush_forward_merge_notifications(self):
@@ -670,40 +745,53 @@ class GitHubMonitorPlugin(Star):
 
             message = "📊 GitHub监控状态\n\n"
 
+            # 时段控制状态
+            if self._as_bool(self.monitor_schedule.get("enabled"), False):
+                schedule_active = self._is_monitoring_active()
+                mode = str(self.monitor_schedule.get("mode") or "blacklist").lower()
+                ranges = self.monitor_schedule.get("ranges") or []
+                mode_text = "仅时段内检测" if mode == "whitelist" else "时段内暂停"
+                message += (
+                    f"⏰ 时段控制：{mode_text} {ranges}"
+                    f"（当前：{'检测中' if schedule_active else '已暂停'}）\n\n"
+                )
+
             for repo_config in repositories:
                 repo_cfg = self._parse_repository_config(repo_config)
                 if not repo_cfg or not repo_cfg.get("owner") or not repo_cfg.get("repo"):
                     continue
                 owner = repo_cfg["owner"]
                 repo = repo_cfg["repo"]
-                branch = repo_cfg["branch"]
-                if not branch:
-                    # 如果没有指定分支，获取默认分支
-                    repo_info = await self.github_service.get_repository_info(owner, repo)
-                    branch = repo_info.get("default_branch", "main") if repo_info else "main"
+                # 解析该仓库监控的所有分支（单分支 / 多分支 / 全部分支）
+                repo_info = await self.github_service.get_repository_info(owner, repo)
+                default_branch = repo_info.get("default_branch", "main") if repo_info else "main"
+                branches = await self._resolve_monitor_branches(
+                    owner, repo, repo_cfg, default_branch
+                )
 
-                repo_key = f"{owner}/{repo}/{branch}"
-                commit_info = commit_data.get(repo_key)
+                for branch in branches:
+                    repo_key = f"{owner}/{repo}/{branch}"
+                    commit_info = commit_data.get(repo_key)
 
-                message += f"📁 {repo_key}\n"
-                if commit_info:
-                    date_str = commit_info.get("date")
-                    formatted_date = None
-                    if date_str:
-                        formatted_date = format_commit_datetime(
-                            date_str,
-                            self.config.get("time_zone", "Asia/Shanghai"),
-                            self.config.get("time_format", "%Y-%m-%d %H:%M:%S"),
-                        )
+                    message += f"📁 {repo_key}\n"
+                    if commit_info:
+                        date_str = commit_info.get("date")
+                        formatted_date = None
+                        if date_str:
+                            formatted_date = format_commit_datetime(
+                                date_str,
+                                self.config.get("time_zone", "Asia/Shanghai"),
+                                self.config.get("time_format", "%Y-%m-%d %H:%M:%S"),
+                            )
 
-                    message += f"  最新Commit: {commit_info['sha'][:7]}\n"
-                    if formatted_date:
-                        message += f"  更新时间: {formatted_date}\n"
+                        message += f"  最新Commit: {commit_info['sha'][:7]}\n"
+                        if formatted_date:
+                            message += f"  更新时间: {formatted_date}\n"
+                        else:
+                            message += "  更新时间: 未知\n"
                     else:
-                        message += "  更新时间: 未知\n"
-                else:
-                    message += "  状态: 未监控到数据\n"
-                message += "\n"
+                        message += "  状态: 未监控到数据\n"
+                    message += "\n"
 
             yield event.plain_result(message)
 
